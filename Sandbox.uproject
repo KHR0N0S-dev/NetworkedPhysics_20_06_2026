@@ -55,6 +55,14 @@
 		{
 			"Name": "Iris",
 			"Enabled": true
+		},
+		{
+			"Name": "MoverExamples",
+			"Enabled": true
+		},
+		{
+			"Name": "MoverIntegrations",
+			"Enabled": true
 		}
 	]
 }
