@@ -108,8 +108,8 @@ void FPhysicsPawnAsync::OnPreSimulate_Internal()
 	}
 	
 	// Calculate forces
-	constexpr float ForceMultiplier = 1000.0f;
-	constexpr float JumpMultiplier = 250.0f;
+	constexpr float ForceMultiplier = 1000000.0f;
+	constexpr float JumpMultiplier = 500.0f;
 
 	const float InputLinearMovementForce = MovementInput_Internal * ForceMultiplier;
 	const float InputLinearSteeringForce = SteeringInput_Internal * ForceMultiplier;
