@@ -5,6 +5,18 @@
 #include "Chaos/PhysicsObjectInterface.h"
 #include "Chaos/PhysicsObjectInternalInterface.h"
 
+static TAutoConsoleVariable<float> CVarPhysicsForceMultiplier(
+	TEXT("p.Pawn.ForceMultiplier"),
+	1000.0f,
+	TEXT("Global multiplier for pawn movement forces."),
+	ECVF_Default);
+
+static TAutoConsoleVariable<float> CVarPhysicsJumpMultiplier(
+	TEXT("p.Pawn.JumpMultiplier"),
+	250.0f,
+	TEXT("Global multiplier for pawn jump forces."),
+	ECVF_Default);
+
 //----------------------------------------------------
 //-------------- Async Networked Physics--------------
 //----------------------------------------------------
@@ -107,9 +119,9 @@ void FPhysicsPawnAsync::OnPreSimulate_Internal()
 		SetBounceInput_Internal(AsyncInput->BounceInput);
 	}
 	
-	// Calculate forces
-	constexpr float ForceMultiplier = 1000000.0f;
-	constexpr float JumpMultiplier = 500.0f;
+	// Get values from CVars
+	const float ForceMultiplier = CVarPhysicsForceMultiplier.GetValueOnAnyThread();
+	const float JumpMultiplier = CVarPhysicsJumpMultiplier.GetValueOnAnyThread();
 
 	const float InputLinearMovementForce = MovementInput_Internal * ForceMultiplier;
 	const float InputLinearSteeringForce = SteeringInput_Internal * ForceMultiplier;
