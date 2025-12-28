@@ -172,7 +172,7 @@ void FPhysicsPawnAsync::OnPreSimulate_Internal()
 	// Apply Angular Forces
 	if (AngularMovement.SizeSquared() > UE_SMALL_NUMBER)
 	{
-		ParticleHandle->AddTorque(AngularMovement, true);
+		//ParticleHandle->AddTorque(AngularMovement, true);
 	}
 }
 
