@@ -17,6 +17,12 @@ static TAutoConsoleVariable<float> CVarPhysicsJumpMultiplier(
 	TEXT("Global multiplier for pawn jump forces."),
 	ECVF_Default);
 
+static TAutoConsoleVariable<float> CVarPhysicsSteerMultiplier(
+	TEXT("p.Pawn.SteerMultiplier"),
+	50.0f,
+	TEXT("Global multiplier for tank steer."),
+	ECVF_Default);
+
 //----------------------------------------------------
 //-------------- Async Networked Physics--------------
 //----------------------------------------------------
@@ -122,6 +128,7 @@ void FPhysicsPawnAsync::OnPreSimulate_Internal()
 	// Get values from CVars
 	const float ForceMultiplier = CVarPhysicsForceMultiplier.GetValueOnAnyThread();
 	const float JumpMultiplier = CVarPhysicsJumpMultiplier.GetValueOnAnyThread();
+	const float SteerMultiplier = CVarPhysicsSteerMultiplier.GetValueOnAnyThread();
 
 	const float InputLinearMovementForce = MovementInput_Internal * ForceMultiplier;
 	const float InputLinearSteeringForce = SteeringInput_Internal * ForceMultiplier;
@@ -131,8 +138,15 @@ void FPhysicsPawnAsync::OnPreSimulate_Internal()
 	
 	const float InputBounceForce = BounceInput_Internal * JumpMultiplier;
 	
-	// Only process horizontal axis not vertical for now
-	Chaos::FVec3 LinearMovement = Chaos::FVec3(InputLinearMovementForce, InputLinearSteeringForce, 0.0f);
+	// We use the particle's current rotation to find the "Forward" direction in world space
+	const Chaos::FRotation3 WorldRotation = ParticleHandle->R();
+	const Chaos::FVec3 ForwardVector = WorldRotation * Chaos::FVec3(1.0f, 0.0f, 0.0f);
+	const Chaos::FVec3 WorldLinearMovement = ForwardVector * InputLinearMovementForce;
+	
+	// Calculate Steering Torque
+	const Chaos::FVec3 LocalUp = Chaos::FVec3(0.0f, 0.0f, 1.0f);
+	const Chaos::FVec3 WorldUp = WorldRotation * LocalUp;
+	const Chaos::FVec3 WorldAngularMovement = WorldUp * InputLinearSteeringForce * SteerMultiplier;
 	
 	if (InputBounceForce > UE_SMALL_NUMBER)
 	{
@@ -161,18 +175,16 @@ void FPhysicsPawnAsync::OnPreSimulate_Internal()
 		bHasProcessedJump = false;
 	}
 	
-	Chaos::FVec3 AngularMovement = Chaos::FVec3(0.0f, InputAngularMovementForce, InputAngularSteeringForce);
-	
 	// Apply Linear Forces 
-	if (LinearMovement.SizeSquared() > UE_SMALL_NUMBER)
+	if (WorldLinearMovement.SizeSquared() > UE_SMALL_NUMBER)
 	{
-		ParticleHandle->AddForce(LinearMovement, true);
+		ParticleHandle->AddForce(WorldLinearMovement, true);
 	}
 	
-	// Apply Angular Forces
-	if (AngularMovement.SizeSquared() > UE_SMALL_NUMBER)
+	// Apply Angular Forces (Turning)
+	if (WorldAngularMovement.SizeSquared() > UE_SMALL_NUMBER)
 	{
-		//ParticleHandle->AddTorque(AngularMovement, true);
+		ParticleHandle->AddTorque(WorldAngularMovement, true);
 	}
 }
 
