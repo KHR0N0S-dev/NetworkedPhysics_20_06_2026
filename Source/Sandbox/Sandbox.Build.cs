@@ -19,11 +19,13 @@ public class Sandbox : ModuleRules
 			"GameplayStateTreeModule",
 			"UMG",
 			"Slate",
-			"Chaos"
+			"Chaos",
+			"ChaosVehicles",
+			"ChaosVehiclesCore",
+			"ChaosVehiclesEngine",
+			"ChaosModularVehicleEngine"
 		});
-
-		PrivateDependencyModuleNames.AddRange(new string[] { });
-
+		
 		PublicIncludePaths.AddRange(new string[] {
 			"Sandbox",
 			"Sandbox/Variant_Platforming",
