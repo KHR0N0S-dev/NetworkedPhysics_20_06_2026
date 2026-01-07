@@ -2,6 +2,10 @@
 #include "SimModule/SimulationModuleBase.h"
 #include "ChaosModularVehicle/ModularVehicleSimulationCU.h"
 #include "PhysicsProxy/ClusterUnionPhysicsProxy.h"
+#include "PBDRigidsSolver.h"
+#include "Chaos/PBDRigidsEvolutionGBF.h"
+#include "Chaos/PBDRigidClustering.h"
+#include "Chaos/ClusterUnionManager.h"
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(VehicleSimArmComponent)
 
@@ -124,13 +128,50 @@ namespace Chaos
 						FinalTransform.SetLocation(NewWorldPos);
 						FinalTransform.SetRotation(ArmRotationInClusterSpace * ChildInitial.GetRotation() * ChildTilt);
 						
-						// Push final position to physics engine
-						ChildParticle->ChildToParent() = FinalTransform;
-
 						// Push to child module for smooth Game Thread interpolation
 						if (FFollowerSimModule* Follower = static_cast<FFollowerSimModule*>(ChildModule))
 						{
 							Follower->SetTargetAnimationTransform(FinalTransform);
+						}
+
+						// Use official API to update child transform and trigger geometry refresh
+						if (FPBDRigidsSolver* Solver = CUProxy->GetSolver<FPBDRigidsSolver>())
+						{
+							if (FPBDRigidsEvolutionGBF* Evolution = static_cast<FPBDRigidsEvolutionGBF*>(Solver->GetEvolution()))
+							{
+								FClusterUnionManager& ClusterUnionManager = Evolution->GetRigidClustering().GetClusterUnionManager();
+								
+								// This also syncs the world transform and queues a geometry refresh
+								TArray<FPBDRigidParticleHandle*> Particles = { ChildParticle };
+								TArray<FTransform> Transforms = { FinalTransform };
+								ClusterUnionManager.UpdateClusterUnionParticlesChildToParent(CUProxy->GetClusterUnionIndex(), Particles, Transforms, false);
+								
+								// Force the queued update to apply NOW
+								ClusterUnionManager.HandleUpdateChildToParentOperation(CUProxy->GetClusterUnionIndex(), Particles);
+							}
+						}
+					}
+				}
+			}
+
+			// 6. Force Collision Update for the Cluster
+			// This is critical! Without this, the bucket moves visually but its collision
+			// representation stays at the start, making it unable to "collect" anything.
+			if (ChildrenToProcess.Num() > 0)
+			{
+				if (FPBDRigidsSolver* Solver = CUProxy->GetSolver<FPBDRigidsSolver>())
+				{
+					if (FPBDRigidsEvolutionGBF* Evolution = static_cast<FPBDRigidsEvolutionGBF*>(Solver->GetEvolution()))
+					{
+						FClusterUnionManager& ClusterUnionManager = Evolution->GetRigidClustering().GetClusterUnionManager();
+						
+						// Process all updates (including geometry refresh) immediately
+						ClusterUnionManager.HandleDeferredClusterUnionUpdateProperties();
+						
+						static int32 LogCounter = 0;
+						if (LogCounter++ % 100 == 0)
+						{
+							UE_LOG(LogTemp, Display, TEXT("Component: ARM SIM | Authoritative Collision Update for Movement"));
 						}
 					}
 				}
