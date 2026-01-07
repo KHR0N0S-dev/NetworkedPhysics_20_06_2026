@@ -7,8 +7,13 @@
 #include "SimModule/SimulationModuleBase.h"
 #include "VehicleSimArmComponent.generated.h"
 
+// -------------------------------------------------------------------
+// PHYSICS SETTINGS (For the Editor)
+// -------------------------------------------------------------------
+
 namespace Chaos
 {
+	/** Settings for the Arm joint */
 	struct FArmSettings
 	{
 		float Stiffness = 500000.0f;
@@ -20,6 +25,26 @@ namespace Chaos
 		FVector Axis = FVector(0.f, 1.f, 0.f);
 	};
 
+	/** Settings for things that follow the Arm (like a bucket) */
+	struct FFollowerSettings
+	{
+		float MoveSpeed = 0.0f;
+		FName InputName = NAME_None;
+		FVector Axis = FVector(0.f, 1.f, 0.f);
+		FVector FollowAxis = FVector(0.f, 1.f, 0.f);
+		float MaxAngle = 45.0f;
+		float MinAngle = -45.0f;
+		bool bInvert = false;
+	};
+}
+
+// -------------------------------------------------------------------
+// SIMULATION MODULES (The Physics Brain)
+// -------------------------------------------------------------------
+
+namespace Chaos
+{
+	/** Module that handles the Arm movement */
 	class FArmSimModule : public ISimulationModuleBase, public TSimModuleSettings<FArmSettings>
 	{
 	public:
@@ -30,8 +55,7 @@ namespace Chaos
 			, CurrentAngle(0.0f)
 			, CurrentAngularVel(0.0f)
 			, bInitialized(false)
-		{
-		}
+		{}
 
 		virtual void Simulate(IPhysicsProxyBase* Proxy, Chaos::FPBDRigidParticleHandle* ParticleHandle, float DeltaTime, const FAllInputs& Inputs, FSimModuleTree& VehicleModuleSystem) override;
 
@@ -54,17 +78,7 @@ namespace Chaos
 		bool bInitialized;
 	};
 
-	struct FFollowerSettings
-	{
-		float MoveSpeed = 0.0f;
-		FName InputName = NAME_None;
-		FVector Axis = FVector(0.f, 1.f, 0.f);
-		FVector FollowAxis = FVector(0.f, 1.f, 0.f);
-		float MaxAngle = 45.0f;
-		float MinAngle = -45.0f;
-		bool bInvert = false;
-	};
-
+	/** Module that handles things attached to the Arm */
 	class FFollowerSimModule : public ISimulationModuleBase, public TSimModuleSettings<FFollowerSettings>
 	{
 	public:
@@ -72,32 +86,22 @@ namespace Chaos
 			: ISimulationModuleBase()
 			, TSimModuleSettings<FFollowerSettings>(InSettings)
 			, CurrentAngle(0.0f)
-		{
-		}
+		{}
 
 		virtual void Simulate(IPhysicsProxyBase* Proxy, Chaos::FPBDRigidParticleHandle* ParticleHandle, float DeltaTime, const FAllInputs& Inputs, FSimModuleTree& VehicleModuleSystem) override;
 
 		virtual void Animate() override 
 		{
-			AnimationData.AnimFlags = Chaos::EAnimationFlags::AnimateRotation;
-			AnimationData.CombinedRotation = FQuat(Setup().Axis, FMath::DegreesToRadians(CurrentAngle));
+			// We handle animation manually in the Arm's Simulate() to fix engine hierarchy bugs
+			AnimationData.AnimFlags = Chaos::EAnimationFlags::AnimateNone;
 		}
 
-		FQuat GetLocalRotation() const
-		{
-			return FQuat(Setup().Axis, FMath::DegreesToRadians(CurrentAngle));
-		}
-
-		FVector GetAxis() const { return Setup().Axis; }
-		FVector GetFollowAxis() const { return Setup().FollowAxis; }
-		bool IsInverted() const { return Setup().bInvert; }
+		FQuat GetLocalRotation() const { return FQuat(Setup().Axis, FMath::DegreesToRadians(CurrentAngle)); }
 
 		virtual const FString GetDebugName() const override { return TEXT("FollowerSimModule"); }
 		virtual bool IsBehaviourType(eSimModuleTypeFlags InType) const override { return false; }
 		virtual TSharedPtr<FModuleNetData> GenerateNetData(const int32 NodeArrayIndex) const override { return nullptr; }
 		
-		static FName GetStaticSimTypeName() { return FName("FFollowerSimModule"); }
-
 		DEFINE_CHAOSSIMTYPENAME(FFollowerSimModule);
 
 	private:
@@ -105,81 +109,71 @@ namespace Chaos
 	};
 }
 
+// -------------------------------------------------------------------
+// COMPONENTS (What you see in the Unreal Editor)
+// -------------------------------------------------------------------
+
+/** Component for the Arm */
 UCLASS(ClassGroup = (ModularVehicle), meta = (BlueprintSpawnableComponent), hidecategories = (Object, Replication, Cooking, Activation, LOD, Physics, Collision, AssetUserData, Event))
 class SANDBOX_API UVehicleSimArmComponent : public UVehicleSimBaseComponent
 {
 	GENERATED_BODY()
 
 public:
-	// Removed UE_API from individual members to fix C2487
 	UVehicleSimArmComponent();
-	virtual ~UVehicleSimArmComponent() = default;
 
-	/** P-gain for the PD controller */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Attributes)
 	float Stiffness;
 
-	/** D-gain for the PD controller */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Attributes)
 	float Damping;
 
-	/** Maximum angle (degrees) */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Attributes)
 	float MaxAngle;
 
-	/** Minimum angle (degrees) */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Attributes)
 	float MinAngle;
 
-	/** Speed at which the target angle changes with input (degrees per second) */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Attributes)
 	float MoveSpeed;
 
-	/** The name of the input axis to listen for (e.g., "RaiseArm") */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Attributes)
 	FName ArmInputName;
 
-	/** Axis of rotation for the joint (Local Space) */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Attributes)
 	FVector RotationAxis;
 
 	virtual ESimModuleType GetModuleType() const override { return ESimModuleType::Rudder; }
-	
 	virtual Chaos::ISimulationModuleBase* CreateNewCoreModule() const override;
 };
 
+/** Component for the Bucket / Follower */
 UCLASS(ClassGroup = (ModularVehicle), meta = (BlueprintSpawnableComponent))
 class SANDBOX_API UVehicleSimFollowerComponent : public UVehicleSimBaseComponent
 {
 	GENERATED_BODY()
+
 public:
 	UVehicleSimFollowerComponent();
 
-	/** Speed at which the follower can rotate (degrees per second). Set to 0 to only follow. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Attributes)
 	float MoveSpeed;
 
-	/** The name of the input axis to listen for (e.g., "RaiseBucket") */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Attributes)
 	FName FollowerInputName;
 
-	/** Axis of rotation for the follower relative to parent (Local Space) */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Attributes)
 	FVector RotationAxis;
 
-	/** Axis used to map the arm's rotation onto the follower. Adjust this if following arm moves in wrong direction. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Attributes)
 	FVector FollowAxis;
 
-	/** Maximum angle (degrees) */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Attributes)
 	float MaxAngle;
 
-	/** Minimum angle (degrees) */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Attributes)
 	float MinAngle;
 
-	/** If true, the rotation inherited from the arm will be inverted. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Attributes)
 	bool bInvertRotation;
 
