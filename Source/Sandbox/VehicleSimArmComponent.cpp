@@ -61,7 +61,7 @@ namespace Chaos
 			CurrentAngle = FMath::Clamp(CurrentAngle, Setup().MinAngle, Setup().MaxAngle);
 			CurrentAngularVel = 0.0f;
 		}
-
+		
 		// 4. Apply Force to Chassis (This is needed, its a tasteless solution but works since its physics)
 		if (ParticleHandle)
 		{
@@ -126,6 +126,12 @@ namespace Chaos
 						
 						// Push final position to physics engine
 						ChildParticle->ChildToParent() = FinalTransform;
+
+						// Push to child module for smooth Game Thread interpolation
+						if (FFollowerSimModule* Follower = static_cast<FFollowerSimModule*>(ChildModule))
+						{
+							Follower->SetTargetAnimationTransform(FinalTransform);
+						}
 					}
 				}
 			}

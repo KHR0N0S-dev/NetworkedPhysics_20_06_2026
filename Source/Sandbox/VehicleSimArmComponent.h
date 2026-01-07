@@ -86,16 +86,26 @@ namespace Chaos
 			: ISimulationModuleBase()
 			, TSimModuleSettings<FFollowerSettings>(InSettings)
 			, CurrentAngle(0.0f)
+			, TargetAnimationTransform(FTransform::Identity)
 		{}
 
 		virtual void Simulate(IPhysicsProxyBase* Proxy, Chaos::FPBDRigidParticleHandle* ParticleHandle, float DeltaTime, const FAllInputs& Inputs, FSimModuleTree& VehicleModuleSystem) override;
 
 		virtual void Animate() override 
 		{
-			// We handle animation manually in the Arm's Simulate() to fix engine hierarchy bugs
-			AnimationData.AnimFlags = Chaos::EAnimationFlags::AnimateNone;
+			// We handle animation manually in the Arm's Simulate() to fix engine hierarchy bugs.
+			// However, we set BOTH flags here to bypass the PT engine's "==" check 
+			// (which skips if flags != Rotation or Position exactly) but still trigger GT interpolation.
+			const FTransform& ChildInitial = GetInitialParticleTransform();
+			
+			AnimationData.AnimFlags = Chaos::EAnimationFlags::AnimateRotation | Chaos::EAnimationFlags::AnimatePosition;
+			
+			// Calculate delta rotation and position for the Game Thread to interpolate smoothly
+			AnimationData.AnimationLocOffset = GetComponentTransform().InverseTransformVector(TargetAnimationTransform.GetLocation() - ChildInitial.GetLocation());
+			AnimationData.CombinedRotation = ChildInitial.GetRotation().Inverse() * TargetAnimationTransform.GetRotation();
 		}
 
+		void SetTargetAnimationTransform(const FTransform& InTransform) { TargetAnimationTransform = InTransform; }
 		FQuat GetLocalRotation() const { return FQuat(Setup().Axis, FMath::DegreesToRadians(CurrentAngle)); }
 
 		virtual const FString GetDebugName() const override { return TEXT("FollowerSimModule"); }
@@ -106,6 +116,7 @@ namespace Chaos
 
 	private:
 		float CurrentAngle;
+		FTransform TargetAnimationTransform;
 	};
 }
 
