@@ -1,6 +1,6 @@
 ﻿# Networked Physics – Chaos Modular Vehicle & Async Physics (UE5.7)
 
-<img src="https://raw.githubusercontent.com/cem-akkaya/NetworkedPhysics/tree/master/Source/1.gif" alt="networked-physics-splash" width="100%"/>
+<img src="https://raw.githubusercontent.com/cem-akkaya/NetworkedPhysics/refs/heads/master/Source/1.gif" alt="networked-physics-splash" width="100%"/>
 
 ## About This Project
 
@@ -26,7 +26,7 @@ Beyond a simple showcase, this project represents my personal journey into the "
 ### 1. Loader Truck (LoaderPawn)
 The `ALoaderPawn` demonstrates a significant extension of the Chaos Modular Vehicle architecture through specialized mechanical systems.
 
-<img src="https://raw.githubusercontent.com/cem-akkaya/NetworkedPhysics/tree/master/Source/3.gif" alt="networked-physics-splash" width="100%"/>
+<img src="https://raw.githubusercontent.com/cem-akkaya/NetworkedPhysics/refs/heads/master/Source/3.gif" alt="networked-physics-splash" width="100%"/>
 
 - **VehicleSimArmComponent & Follower**: A primary technical highlight. This is a custom-built simulation module that adds interactive arm manipulation (e.g., for loaders, cranes, or excavators). It demonstrates how to create custom PT (Physics Thread) simulation logic that integrates seamlessly with the modular vehicle tree.
 - **LoaderSimComponent**: An extension of `UModularVehicleBaseComponent` that manages the core vehicle dynamics while coordinating the custom arm and bucket sub-modules.
@@ -35,7 +35,7 @@ The `ALoaderPawn` demonstrates a significant extension of the Chaos Modular Vehi
 ### 2. Wrecking Ball Controller (MyPhysicsPawn)
 This component implements the manual asynchronous networked physics logic detailed in the community tutorial, serving as a robust base for state synchronization.
 
-<img src="https://raw.githubusercontent.com/cem-akkaya/NetworkedPhysics/tree/master/Source/2.gif" alt="networked-physics-splash" width="100%"/>
+<img src="https://raw.githubusercontent.com/cem-akkaya/NetworkedPhysics/refs/heads/master/Source/2.gif" alt="networked-physics-splash" width="100%"/>
 
 - **Tutorial Implementation**: Provides a clean, documented implementation of `Chaos::TSimCallbackObject` and `FNetworkPhysicsPayload`.
 - **Synchronization Logic**: Demonstrates reliable input and state replication across the network with client-side prediction and server reconciliation.
