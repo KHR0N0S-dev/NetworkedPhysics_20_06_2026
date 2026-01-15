@@ -1,5 +1,8 @@
 ﻿# Networked Physics – Chaos Modular Vehicle & Async Physics (UE5.7)
 
+> **Important Note**  
+> This project is built using a **custom Unreal Engine 5.7 source build** with **engine-level modifications and extensions** applied. Several systems showcased here rely on changes made directly to the engine source, particularly around Chaos Physics, Modular Vehicles, and asynchronous simulation behavior that you can find in my repository.
+
 <img src="https://raw.githubusercontent.com/cem-akkaya/NetworkedPhysics/refs/heads/master/Source/1.gif" alt="networked-physics-splash" width="100%"/>
 
 ## About This Project
@@ -32,7 +35,20 @@ The `ALoaderPawn` demonstrates a significant extension of the Chaos Modular Vehi
 - **LoaderSimComponent**: An extension of `UModularVehicleBaseComponent` that manages the core vehicle dynamics while coordinating the custom arm and bucket sub-modules.
 - **Hierarchical Simulation**: Showcases complex part-to-part physics relationships and animation synchronization between the Physics Thread and Game Thread.
 
-### 2. Wrecking Ball Controller (MyPhysicsPawn)
+### 2. Mining Truck
+This additional pawn is a second **Chaos Modular Vehicle–based implementation** designed to more closely resemble **real-life industrial machinery** rather than arcade-style vehicles.
+
+<img src="https://raw.githubusercontent.com/cem-akkaya/NetworkedPhysics/refs/heads/master/Source/4.gif" alt="networked-physics-splash" width="100%"/>
+
+- **Shared Arm System**: Uses the same `VehicleSimArmComponent` and follower setup as the LoaderPawn, validating that the arm simulation is reusable across different vehicle configurations.
+- **Heavy Mass Configuration**: Significantly increased vehicle mass and inertia to emphasize momentum, stability, and resistance to sudden directional changes.
+- **Low-Speed Dynamics**: Tuned for slow, deliberate movement typical of industrial vehicles rather than road cars.
+- **High Gear Ratios**: Transmission and drivetrain configured with high gear ratios to provide strong torque at low speeds, closely matching real-world construction and utility vehicles.
+- **Realistic Handling Feel**: Emphasizes correct torque distribution, reduced wheel slip, and physically plausible turning behavior under load.
+
+This pawn exists primarily as a **physics validation case**, ensuring that the modular vehicle and arm systems behave correctly under heavy loads and realistic drivetrain constraints.
+
+### 3. Wrecking Ball Controller (MyPhysicsPawn)
 This component implements the manual asynchronous networked physics logic detailed in the community tutorial, serving as a robust base for state synchronization.
 
 <img src="https://raw.githubusercontent.com/cem-akkaya/NetworkedPhysics/refs/heads/master/Source/2.gif" alt="networked-physics-splash" width="100%"/>
@@ -54,4 +70,3 @@ This component implements the manual asynchronous networked physics logic detail
 2. Inputs are sent to the **Physics Thread** via `FAsyncInputPhysicsPawn`.
 3. `FPhysicsPawnAsync` processes movement and forces during `OnPreSimulate_Internal`.
 4. State is synchronized back using the `UNetworkPhysicsComponent`.
-
