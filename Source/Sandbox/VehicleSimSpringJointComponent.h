@@ -73,10 +73,6 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spring")
 	float SimulatedMass;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spring")
-	bool bUpdateComponentTransform = true;
-
 	virtual ESimModuleType GetModuleType() const override { return ESimModuleType::Suspension; }
-	virtual void OnOutputReady(const Chaos::FSimOutputData* OutputData) override;
 	virtual Chaos::ISimulationModuleBase* CreateNewCoreModule() const override;
 };

@@ -20,30 +20,27 @@ namespace Chaos
 			CurrentLinearVel = FVector::ZeroVector;
 			bInitialized = true;
 		}
-		
+
+		// Get local velocity of this module.
+		// In a Modular Vehicle, this is usually the velocity of the parent rigid body in the module's local space.
 		const FVector LocalVel = GetLocalLinearVelocity();
 
-		static int32 LogCounter = 0;
-		if (LogCounter++ % 100 == 0)
-		{
-			UE_LOG(LogTemp, Display, TEXT("SpringJointSimModule: LocalVel=%s, Offset=%s"), *LocalVel.ToString(), *CurrentLinearOffset.ToString());
-		} 
-
-		// Lag force proportional to velocity
+		// pushing the spring back.
 		FVector DisplacementForce = -LocalVel * Setup().SimulatedMass;
-		// Spring back to origin
+
+		// restore
 		FVector RestoringForce = -Setup().LinearStiffness * CurrentLinearOffset;
-		// Damping
+
+		// DampingForce
 		FVector DampingForce = -Setup().LinearDamping * CurrentLinearVel;
 
 		FVector TotalLinearForce = DisplacementForce + RestoringForce + DampingForce;
 
-		// Integrate
 		float Mass = FMath::Max(Setup().SimulatedMass, 1.0f);
 		CurrentLinearVel += (TotalLinearForce / Mass) * DeltaTime;
 		CurrentLinearOffset += CurrentLinearVel * DeltaTime;
 
-		// Clamp Offset
+		// Clamp Offset to prevent extreme values but maybe we can interpolate for a natural move?
 		CurrentLinearOffset.X = FMath::Clamp(CurrentLinearOffset.X, -Setup().LinearMaxOffset.X, Setup().LinearMaxOffset.X);
 		CurrentLinearOffset.Y = FMath::Clamp(CurrentLinearOffset.Y, -Setup().LinearMaxOffset.Y, Setup().LinearMaxOffset.Y);
 		CurrentLinearOffset.Z = FMath::Clamp(CurrentLinearOffset.Z, -Setup().LinearMaxOffset.Z, Setup().LinearMaxOffset.Z);
@@ -52,9 +49,8 @@ namespace Chaos
 	void FSpringJointSimModule::Animate()
 	{
 		// pass the displacement to the Game Thread
-		AnimationData.AnimFlags = Chaos::EAnimationFlags::AnimatePosition | Chaos::EAnimationFlags::AnimateRotation;
+		AnimationData.AnimFlags = Chaos::EAnimationFlags::AnimatePosition;
 		AnimationData.AnimationLocOffset = CurrentLinearOffset;
-		AnimationData.AnimationRotOffset = FRotator::ZeroRotator; // For now zero, but we could add rotation if needed
 	}
 }
 
@@ -64,7 +60,6 @@ UVehicleSimSpringJointComponent::UVehicleSimSpringJointComponent()
 	LinearDamping = 5000.0f;
 	LinearMaxOffset = FVector(50.0f, 50.0f, 50.0f);
 	SimulatedMass = 100.0f;
-	bUpdateComponentTransform = true;
 	bAnimationEnabled = true;
 }
 
@@ -79,27 +74,4 @@ Chaos::ISimulationModuleBase* UVehicleSimSpringJointComponent::CreateNewCoreModu
 	Chaos::FSpringJointSimModule* NewModule = new Chaos::FSpringJointSimModule(Settings);
 	NewModule->SetAnimationEnabled(bAnimationEnabled);
 	return NewModule;
-}
-
-void UVehicleSimSpringJointComponent::OnOutputReady(const Chaos::FSimOutputData* OutputData)
-{
-	if (bUpdateComponentTransform && OutputData)
-	{
-		const uint16 Flags = OutputData->AnimationData.AnimFlags;
-		if (Flags & (uint16)Chaos::EAnimationFlags::AnimatePosition)
-		{
-			SetRelativeLocation(OutputData->AnimationData.AnimationLocOffset);
-		}
-		
-		if (Flags & (uint16)Chaos::EAnimationFlags::AnimateRotation)
-		{
-			SetRelativeRotation(OutputData->AnimationData.AnimationRotOffset);
-		}
-
-		if (Flags & ((uint16)Chaos::EAnimationFlags::AnimatePosition | (uint16)Chaos::EAnimationFlags::AnimateRotation))
-		{
-			UpdateChildTransforms();
-			MarkRenderTransformDirty();
-		}
-	}
 }
