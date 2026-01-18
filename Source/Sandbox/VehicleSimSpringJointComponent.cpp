@@ -52,8 +52,9 @@ namespace Chaos
 	void FSpringJointSimModule::Animate()
 	{
 		// pass the displacement to the Game Thread
-		AnimationData.AnimFlags = Chaos::EAnimationFlags::AnimatePosition;
+		AnimationData.AnimFlags = Chaos::EAnimationFlags::AnimatePosition | Chaos::EAnimationFlags::AnimateRotation;
 		AnimationData.AnimationLocOffset = CurrentLinearOffset;
+		AnimationData.AnimationRotOffset = FRotator::ZeroRotator; // For now zero, but we could add rotation if needed
 	}
 }
 
@@ -82,8 +83,23 @@ Chaos::ISimulationModuleBase* UVehicleSimSpringJointComponent::CreateNewCoreModu
 
 void UVehicleSimSpringJointComponent::OnOutputReady(const Chaos::FSimOutputData* OutputData)
 {
-	if (bUpdateComponentTransform && OutputData && (OutputData->AnimationData.AnimFlags & Chaos::EAnimationFlags::AnimatePosition))
+	if (bUpdateComponentTransform && OutputData)
 	{
-		SetWorldLocation(OutputData->AnimationData.AnimationLocOffset);
+		const uint16 Flags = OutputData->AnimationData.AnimFlags;
+		if (Flags & (uint16)Chaos::EAnimationFlags::AnimatePosition)
+		{
+			SetRelativeLocation(OutputData->AnimationData.AnimationLocOffset);
+		}
+		
+		if (Flags & (uint16)Chaos::EAnimationFlags::AnimateRotation)
+		{
+			SetRelativeRotation(OutputData->AnimationData.AnimationRotOffset);
+		}
+
+		if (Flags & ((uint16)Chaos::EAnimationFlags::AnimatePosition | (uint16)Chaos::EAnimationFlags::AnimateRotation))
+		{
+			UpdateChildTransforms();
+			MarkRenderTransformDirty();
+		}
 	}
 }
