@@ -27,7 +27,7 @@ namespace Chaos
 		if (LogCounter++ % 100 == 0)
 		{
 			UE_LOG(LogTemp, Display, TEXT("SpringJointSimModule: LocalVel=%s, Offset=%s"), *LocalVel.ToString(), *CurrentLinearOffset.ToString());
-		}
+		} 
 
 		// Lag force proportional to velocity
 		FVector DisplacementForce = -LocalVel * Setup().SimulatedMass;
@@ -63,6 +63,7 @@ UVehicleSimSpringJointComponent::UVehicleSimSpringJointComponent()
 	LinearDamping = 5000.0f;
 	LinearMaxOffset = FVector(50.0f, 50.0f, 50.0f);
 	SimulatedMass = 100.0f;
+	bUpdateComponentTransform = true;
 	bAnimationEnabled = true;
 }
 
@@ -77,4 +78,12 @@ Chaos::ISimulationModuleBase* UVehicleSimSpringJointComponent::CreateNewCoreModu
 	Chaos::FSpringJointSimModule* NewModule = new Chaos::FSpringJointSimModule(Settings);
 	NewModule->SetAnimationEnabled(bAnimationEnabled);
 	return NewModule;
+}
+
+void UVehicleSimSpringJointComponent::OnOutputReady(const Chaos::FSimOutputData* OutputData)
+{
+	if (bUpdateComponentTransform && OutputData && (OutputData->AnimationData.AnimFlags & Chaos::EAnimationFlags::AnimatePosition))
+	{
+		SetWorldLocation(OutputData->AnimationData.AnimationLocOffset);
+	}
 }
