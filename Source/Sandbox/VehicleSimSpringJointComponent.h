@@ -19,6 +19,10 @@ namespace Chaos
 		
 		// Mass approximation for internal simulation
 		float SimulatedMass = 100.0f;
+
+		bool bReverseX = false;
+		bool bReverseY = false;
+		bool bReverseZ = false;
 	};
 
 	/** Module that handles a simplified location-only lag effect between parent and children */
@@ -72,6 +76,15 @@ public:
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spring")
 	float SimulatedMass;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spring")
+	bool bReverseX;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spring")
+	bool bReverseY;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spring")
+	bool bReverseZ;
 
 	virtual ESimModuleType GetModuleType() const override { return ESimModuleType::Suspension; }
 	virtual Chaos::ISimulationModuleBase* CreateNewCoreModule() const override;

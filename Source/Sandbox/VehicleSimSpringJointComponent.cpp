@@ -50,7 +50,13 @@ namespace Chaos
 	{
 		// pass the displacement to the Game Thread
 		AnimationData.AnimFlags = Chaos::EAnimationFlags::AnimatePosition;
-		AnimationData.AnimationLocOffset = CurrentLinearOffset;
+
+		FVector AnimatedOffset = CurrentLinearOffset;
+		if (Setup().bReverseX) AnimatedOffset.X *= -1.0f;
+		if (Setup().bReverseY) AnimatedOffset.Y *= -1.0f;
+		if (Setup().bReverseZ) AnimatedOffset.Z *= -1.0f;
+
+		AnimationData.AnimationLocOffset = AnimatedOffset;
 	}
 }
 
@@ -60,6 +66,9 @@ UVehicleSimSpringJointComponent::UVehicleSimSpringJointComponent()
 	LinearDamping = 5000.0f;
 	LinearMaxOffset = FVector(50.0f, 50.0f, 50.0f);
 	SimulatedMass = 100.0f;
+	bReverseX = false;
+	bReverseY = false;
+	bReverseZ = false;
 	bAnimationEnabled = true;
 }
 
@@ -70,6 +79,9 @@ Chaos::ISimulationModuleBase* UVehicleSimSpringJointComponent::CreateNewCoreModu
 	Settings.LinearDamping = LinearDamping;
 	Settings.LinearMaxOffset = LinearMaxOffset;
 	Settings.SimulatedMass = SimulatedMass;
+	Settings.bReverseX = bReverseX;
+	Settings.bReverseY = bReverseY;
+	Settings.bReverseZ = bReverseZ;
 
 	Chaos::FSpringJointSimModule* NewModule = new Chaos::FSpringJointSimModule(Settings);
 	NewModule->SetAnimationEnabled(bAnimationEnabled);
