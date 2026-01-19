@@ -67,15 +67,27 @@ namespace Chaos
 		}
 		
 		// 4. Apply Force to Chassis (This is needed, its a tasteless solution but works since its physics)
-		if (ParticleHandle)
-		{
-			if (ISimulationModuleBase* ChassisModule = VehicleModuleSystem.AccessSimModule(0))
+			if (ParticleHandle)
 			{
-				const FVector ClusterHingeAxis = GetInitialParticleTransform().GetRotation().RotateVector(Setup().Axis);
-				const FVector WorldHingeAxis = ParticleHandle->GetR().RotateVector(ClusterHingeAxis);
-				ChassisModule->AddLocalTorque(WorldHingeAxis * -TorqueMagnitude, true, false);
+				if (ISimulationModuleBase* ChassisModule = VehicleModuleSystem.AccessSimModule(0))
+				{
+					FQuat ParticleRotation = ParticleHandle->GetR();
+					ParticleRotation.Normalize();
+
+					FQuat ParentInitialRotation = GetInitialParticleTransform().GetRotation();
+					ParentInitialRotation.Normalize();
+
+					FVector NormalizedAxis = Setup().Axis;
+					if (!NormalizedAxis.IsNormalized())
+					{
+						NormalizedAxis.Normalize();
+					}
+
+					const FVector ClusterHingeAxis = ParentInitialRotation.RotateVector(NormalizedAxis);
+					const FVector WorldHingeAxis = ParticleRotation.RotateVector(ClusterHingeAxis);
+					ChassisModule->AddLocalTorque(WorldHingeAxis * -TorqueMagnitude, true, false);
+				}
 			}
-		}
 
 		// 5. Move Attached Children (Find Them )
 		if (Proxy && Proxy->GetType() == EPhysicsProxyType::ClusterUnionProxy)
@@ -100,7 +112,16 @@ namespace Chaos
 			}
 			
 			const FTransform& ParentInitial = GetInitialParticleTransform();
-			const FVector ClusterHingeAxis = ParentInitial.GetRotation().RotateVector(Setup().Axis);
+			FQuat ParentInitialRotation = ParentInitial.GetRotation();
+			ParentInitialRotation.Normalize();
+
+			FVector NormalizedAxis = Setup().Axis;
+			if (!NormalizedAxis.IsNormalized())
+			{
+				NormalizedAxis.Normalize();
+			}
+
+			const FVector ClusterHingeAxis = ParentInitialRotation.RotateVector(NormalizedAxis);
 			const FQuat ArmRotationInClusterSpace = FQuat(ClusterHingeAxis, FMath::DegreesToRadians(CurrentAngle));
 			
 			for (int32 ChildIdx : ChildrenToProcess)
@@ -124,9 +145,15 @@ namespace Chaos
 						const FVector NewWorldPos = ParentInitial.GetLocation() + RotatedPos;
 						
 						// Calculate the new orientation
+						FQuat ChildInitialRotation = ChildInitial.GetRotation();
+						ChildInitialRotation.Normalize();
+
+						FQuat FinalRotation = ArmRotationInClusterSpace * ChildInitialRotation * ChildTilt;
+						FinalRotation.Normalize();
+
 						FTransform FinalTransform = ChildInitial;
 						FinalTransform.SetLocation(NewWorldPos);
-						FinalTransform.SetRotation(ArmRotationInClusterSpace * ChildInitial.GetRotation() * ChildTilt);
+						FinalTransform.SetRotation(FinalRotation);
 						
 						// Push to child module for smooth Game Thread interpolation
 						if (FFollowerSimModule* Follower = static_cast<FFollowerSimModule*>(ChildModule))

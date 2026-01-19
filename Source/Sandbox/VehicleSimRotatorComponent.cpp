@@ -69,9 +69,21 @@ namespace Chaos
 			if (ChildrenToProcess.Num() > 0)
 			{
 				const FTransform& ParentInitial = GetInitialParticleTransform();
-				const FVector ClusterHingeAxis = ParentInitial.GetRotation().RotateVector(Setup().RotationAxis);
+				FQuat ParentInitialRotation = ParentInitial.GetRotation();
+				ParentInitialRotation.Normalize();
+
+				FVector NormalizedRotationAxis = Setup().RotationAxis;
+				if (!NormalizedRotationAxis.IsNormalized())
+				{
+					NormalizedRotationAxis.Normalize();
+				}
+
+				const FVector ClusterHingeAxis = ParentInitialRotation.RotateVector(NormalizedRotationAxis);
 				const FQuat RotatorRotation = FQuat(ClusterHingeAxis, CurrentAngle);
 				
+				// Force a collision update for the cluster if children moved
+				bool bNeedsCollisionUpdate = false;
+
 				for (int32 ChildIdx : ChildrenToProcess)
 				{
 					if (ISimulationModuleBase* ChildModule = VehicleModuleSystem.AccessSimModule(ChildIdx))
@@ -80,14 +92,20 @@ namespace Chaos
 						if (FPBDRigidClusteredParticleHandle* ChildParticle = ChildModule->GetClusterParticle(CUProxy))
 						{
 							const FTransform& ChildInitial = ChildModule->GetInitialParticleTransform();
-
+							
 							// Calculate the new location (Arc movement)
+							// We use the InitialParticleTransform which should be the pivot location in Cluster space.
+							// For Geometry Collections, the particle's X is its CoM, but the ClusterUnionManager::UpdateClusterUnionParticlesChildToParent
+							// expects the transform of the particle's origin (pivot) relative to the Cluster Union origin.
 							const FVector RelativeInitialPos = ChildInitial.GetLocation() - ParentInitial.GetLocation();
 							const FVector RotatedPos = RotatorRotation.RotateVector(RelativeInitialPos);
 							const FVector NewWorldPos = ParentInitial.GetLocation() + RotatedPos;
-							
+
 							// Calculate the new orientation
-							FQuat FinalRotation = RotatorRotation * ChildInitial.GetRotation();
+							FQuat ChildInitialRotation = ChildInitial.GetRotation();
+							ChildInitialRotation.Normalize();
+
+							FQuat FinalRotation = RotatorRotation * ChildInitialRotation;
 							FinalRotation.Normalize();
 
 							FTransform FinalTransform = ChildInitial;
@@ -103,8 +121,23 @@ namespace Chaos
 									TArray<FPBDRigidParticleHandle*> Particles = { ChildParticle };
 									TArray<FTransform> Transforms = { FinalTransform };
 									ClusterUnionManager.UpdateClusterUnionParticlesChildToParent(CUProxy->GetClusterUnionIndex(), Particles, Transforms, false);
+									
+									// Explicitly trigger the update to ensure it reflects in the next physics step
+									ClusterUnionManager.HandleUpdateChildToParentOperation(CUProxy->GetClusterUnionIndex(), Particles);
+									bNeedsCollisionUpdate = true;
 								}
 							}
+						}
+					}
+				}
+
+				if (bNeedsCollisionUpdate)
+				{
+					if (FPBDRigidsSolver* Solver = CUProxy->GetSolver<FPBDRigidsSolver>())
+					{
+						if (FPBDRigidsEvolutionGBF* Evolution = static_cast<FPBDRigidsEvolutionGBF*>(Solver->GetEvolution()))
+						{
+							Evolution->GetRigidClustering().GetClusterUnionManager().HandleDeferredClusterUnionUpdateProperties();
 						}
 					}
 				}
@@ -115,7 +148,15 @@ namespace Chaos
 	void FRotatorSimModule::Animate()
 	{
 		AnimationData.AnimFlags = Chaos::EAnimationFlags::AnimateRotation;
-		AnimationData.CombinedRotation = FQuat(Setup().RotationAxis, CurrentAngle);
+		
+		FVector NormalizedRotationAxis = Setup().RotationAxis;
+		if (!NormalizedRotationAxis.IsNormalized())
+		{
+			NormalizedRotationAxis.Normalize();
+		}
+
+		AnimationData.CombinedRotation = FQuat(NormalizedRotationAxis, CurrentAngle);
+		AnimationData.CombinedRotation.Normalize();
 	}
 }
 
