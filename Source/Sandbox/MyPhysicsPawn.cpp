@@ -139,7 +139,7 @@ void FPhysicsPawnAsync::OnPreSimulate_Internal()
 	const float InputBounceForce = BounceInput_Internal * JumpMultiplier;
 	
 	// We use the particle's current rotation to find the "Forward" direction in world space
-	const Chaos::FRotation3 WorldRotation = ParticleHandle->R();
+	const Chaos::FRotation3 WorldRotation = ParticleHandle->GetR();
 	const Chaos::FVec3 ForwardVector = WorldRotation * Chaos::FVec3(1.0f, 0.0f, 0.0f);
 	const Chaos::FVec3 WorldLinearMovement = ForwardVector * InputLinearMovementForce;
 	
