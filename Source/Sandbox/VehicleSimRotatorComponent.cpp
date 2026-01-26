@@ -99,6 +99,22 @@ TArray<FModuleInputSetup> UVehicleSimRotatorComponent::GetInputConfig() const
 	return Config;
 }
 
+void UVehicleSimRotatorComponent::OnOutputReady(const Chaos::FSimOutputData* OutputData)
+{
+	if (OutputData && (OutputData->AnimationData.AnimFlags & Chaos::EAnimationFlags::AnimateRotation))
+	{
+		// Get the component this rotator is attached to
+		if (USceneComponent* Parent = GetAttachParent())
+		{
+			// Apply the rotation to the parent component cause we built like that
+			Parent->SetRelativeRotation(OutputData->AnimationData.AnimationRotOffset);
+			// do yourself too interesting but works somehow it rotates the bone directly need to poke around more
+			SetRelativeRotation(OutputData->AnimationData.AnimationRotOffset);
+
+		}
+	}
+}
+
 Chaos::ISimulationModuleBase* UVehicleSimRotatorComponent::CreateNewCoreModule() const
 {
 	Chaos::FRotatorSettings Settings;

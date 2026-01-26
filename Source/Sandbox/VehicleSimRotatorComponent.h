@@ -4,6 +4,7 @@
 
 #include "CoreMinimal.h"
 #include "ChaosModularVehicle/VehicleSimBaseComponent.h"
+#include "GeometryCollection/GeometryCollectionComponent.h"
 #include "SimModule/SimulationModuleBase.h"
 #include "VehicleSimRotatorComponent.generated.h"
 
@@ -89,6 +90,8 @@ public:
 	virtual ESimModuleType GetModuleType() const override { return ESimModuleType::Undefined; }
 	virtual TArray<FModuleInputSetup> GetInputConfig() const override;
 	virtual Chaos::ISimulationModuleBase* CreateNewCoreModule() const override;
+
+	virtual void OnOutputReady(const Chaos::FSimOutputData* OutputData) override;
 
 private:
 	// The target angle for the joint

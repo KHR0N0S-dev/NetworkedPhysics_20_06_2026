@@ -23,6 +23,7 @@ public class Sandbox : ModuleRules
 			"ChaosVehicles",
 			"ChaosVehiclesCore",
 			"ChaosVehiclesEngine",
+			"GeometryCollectionEngine",
 			"ChaosModularVehicleEngine"
 		});
 		
