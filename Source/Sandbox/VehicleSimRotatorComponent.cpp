@@ -1,13 +1,5 @@
 ﻿#include "VehicleSimRotatorComponent.h"
-#include "SimModule/SimulationModuleBase.h"
-#include "ChaosModularVehicle/ModularVehicleSimulationCU.h"
 #include "ChaosModularVehicle/ModularVehicleBaseComponent.h"
-#include "SimModule/SimModuleTree.h"
-#include "PhysicsProxy/ClusterUnionPhysicsProxy.h"
-#include "PBDRigidsSolver.h"
-#include "Chaos/PBDRigidsEvolutionGBF.h"
-#include "Chaos/PBDRigidClustering.h"
-#include "Chaos/ClusterUnionManager.h"
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(VehicleSimRotatorComponent)
 
@@ -53,96 +45,6 @@ namespace Chaos
 		float MaxRad = FMath::DegreesToRadians(Setup().MaxAngle);
 		TargetAngle = FMath::Clamp(TargetAngle, MinRad, MaxRad);
 		CurrentAngle = TargetAngle;
-
-		// 2. Physically move attached children (Exactly mirroring FArmSimModule pattern)
-		if (Proxy && Proxy->GetType() == EPhysicsProxyType::ClusterUnionProxy)
-		{
-			FClusterUnionPhysicsProxy* CUProxy = static_cast<FClusterUnionPhysicsProxy*>(Proxy);
-			
-			// Find all children
-			TArray<int32> ChildrenToProcess;
-			for (int32 ChildIdx : VehicleModuleSystem.GetChildren(SimTreeIndex)) 
-			{
-				ChildrenToProcess.Add(ChildIdx);
-			}
-
-			if (ChildrenToProcess.Num() > 0)
-			{
-				const FTransform& ParentInitial = GetInitialParticleTransform();
-				FQuat ParentInitialRotation = ParentInitial.GetRotation();
-				ParentInitialRotation.Normalize();
-
-				FVector NormalizedRotationAxis = Setup().RotationAxis;
-				if (!NormalizedRotationAxis.IsNormalized())
-				{
-					NormalizedRotationAxis.Normalize();
-				}
-
-				const FVector ClusterHingeAxis = ParentInitialRotation.RotateVector(NormalizedRotationAxis);
-				const FQuat RotatorRotation = FQuat(ClusterHingeAxis, CurrentAngle);
-				
-				// Force a collision update for the cluster if children moved
-				bool bNeedsCollisionUpdate = false;
-
-				for (int32 ChildIdx : ChildrenToProcess)
-				{
-					if (ISimulationModuleBase* ChildModule = VehicleModuleSystem.AccessSimModule(ChildIdx))
-					{
-						// For Child ID get ChildParticle , Update and Push
-						if (FPBDRigidClusteredParticleHandle* ChildParticle = ChildModule->GetClusterParticle(CUProxy))
-						{
-							const FTransform& ChildInitial = ChildModule->GetInitialParticleTransform();
-							
-							// Calculate the new location (Arc movement)
-							// We use the InitialParticleTransform which should be the pivot location in Cluster space.
-							// For Geometry Collections, the particle's X is its CoM, but the ClusterUnionManager::UpdateClusterUnionParticlesChildToParent
-							// expects the transform of the particle's origin (pivot) relative to the Cluster Union origin.
-							const FVector RelativeInitialPos = ChildInitial.GetLocation() - ParentInitial.GetLocation();
-							const FVector RotatedPos = RotatorRotation.RotateVector(RelativeInitialPos);
-							const FVector NewWorldPos = ParentInitial.GetLocation() + RotatedPos;
-
-							// Calculate the new orientation
-							FQuat ChildInitialRotation = ChildInitial.GetRotation();
-							ChildInitialRotation.Normalize();
-
-							FQuat FinalRotation = RotatorRotation * ChildInitialRotation;
-							FinalRotation.Normalize();
-
-							FTransform FinalTransform = ChildInitial;
-							FinalTransform.SetLocation(NewWorldPos);
-							FinalTransform.SetRotation(FinalRotation);
-							
-							if (FPBDRigidsSolver* Solver = CUProxy->GetSolver<FPBDRigidsSolver>())
-							{
-								if (FPBDRigidsEvolutionGBF* Evolution = static_cast<FPBDRigidsEvolutionGBF*>(Solver->GetEvolution()))
-								{
-									FClusterUnionManager& ClusterUnionManager = Evolution->GetRigidClustering().GetClusterUnionManager();
-									
-									TArray<FPBDRigidParticleHandle*> Particles = { ChildParticle };
-									TArray<FTransform> Transforms = { FinalTransform };
-									ClusterUnionManager.UpdateClusterUnionParticlesChildToParent(CUProxy->GetClusterUnionIndex(), Particles, Transforms, false);
-									
-									// Explicitly trigger the update to ensure it reflects in the next physics step
-									ClusterUnionManager.HandleUpdateChildToParentOperation(CUProxy->GetClusterUnionIndex(), Particles);
-									bNeedsCollisionUpdate = true;
-								}
-							}
-						}
-					}
-				}
-
-				if (bNeedsCollisionUpdate)
-				{
-					if (FPBDRigidsSolver* Solver = CUProxy->GetSolver<FPBDRigidsSolver>())
-					{
-						if (FPBDRigidsEvolutionGBF* Evolution = static_cast<FPBDRigidsEvolutionGBF*>(Solver->GetEvolution()))
-						{
-							Evolution->GetRigidClustering().GetClusterUnionManager().HandleDeferredClusterUnionUpdateProperties();
-						}
-					}
-				}
-			}
-		}
 	}
 
 	void FRotatorSimModule::Animate()
