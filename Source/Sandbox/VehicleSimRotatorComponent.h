@@ -91,7 +91,6 @@ public:
 	virtual TArray<FModuleInputSetup> GetInputConfig() const override;
 	virtual Chaos::ISimulationModuleBase* CreateNewCoreModule() const override;
 
-	virtual void OnOutputReady(const Chaos::FSimOutputData* OutputData) override;
 
 private:
 	// The target angle for the joint
