@@ -3,7 +3,7 @@
 > **Important Note**  
 > This project is built using a **custom Unreal Engine 5.7 source build** with **engine-level modifications and extensions** applied. Several systems showcased here rely on changes made directly to the engine source, particularly around Chaos Physics, Modular Vehicles, and asynchronous simulation behavior that you can find in my repository.
 
-<img src="https://raw.githubusercontent.com/cem-akkaya/NetworkedPhysics/refs/heads/master/Source/1.gif" alt="networked-physics-splash" width="100%"/>
+<img src="https://raw.githubusercontent.com/cem-akkaya/NetworkedPhysics/refs/heads/master/Source/5.gif" alt="networked-physics-splash" width="100%"/>
 
 ## About This Project
 
@@ -26,7 +26,32 @@ Beyond a simple showcase, this project represents my personal journey into the "
 
 ## Key Components
 
-### 1. Loader Truck (LoaderPawn)
+### 1. Pod Racer (Experimental Multi-Body Physics Vehicle)
+
+The Pod Racer is an experimental, high-velocity vehicle setup designed to explore **force-driven, multi-body physics behavior** under extreme conditions. Unlike the Loader and Mining Truck, this vehicle does **not** rely on the Chaos Modular Vehicle framework. Instead, it is built entirely from independently simulated physics bodies connected through carefully tuned soft constraints.
+
+<img src="https://raw.githubusercontent.com/cem-akkaya/NetworkedPhysics/refs/heads/master/Source/6.gif" alt="networked-physics-splash" width="100%"/>
+
+The setup consists of:
+- A central pod acting as the control and stabilization body
+- Two independent thrusters, each simulated as separate rigid bodies
+- Motorcycle-like suspension systems on each thruster
+- A chassis configuration responsible for aerodynamic drag
+- Forward propulsion forces combined with upward aerofoil lift forces
+
+All physics bodies are connected using soft, balanced constraints that allow controlled, chaotic motion while maintaining overall stability at very high speeds. The vehicle behaves almost like a low-altitude flying craft, while remaining constrained to ground-level interaction.
+
+This setup runs through **async, networked physics** and is explicitly tuned to remain stable under extreme velocity, high force magnitudes, and aggressive player input. Rather than relying on heavy assists or self-correcting behavior, control responsiveness is preserved while requiring player mastery. The vehicle does not drive itself; understanding its dynamics is part of the experience.
+
+The Pod Racer exists as a **physics and gameplay experiment**, focusing on:
+- Multi-body force interaction at high velocity
+- Stability and constraint behavior under stress
+- Balancing realism with readable, skill-based control
+- Exploring the limits of networked async physics outside traditional vehicle abstractions
+
+This pawn serves as a contrast case to the Chaos Modular Vehicles in this repository, demonstrating a different approach to complex vehicle simulation where behavior emerges primarily from force balance and constraint tuning rather than predefined vehicle models.
+
+### 2. Loader Truck (LoaderPawn)
 The `ALoaderPawn` demonstrates a significant extension of the Chaos Modular Vehicle architecture through specialized mechanical systems.
 
 <img src="https://raw.githubusercontent.com/cem-akkaya/NetworkedPhysics/refs/heads/master/Source/3.gif" alt="networked-physics-splash" width="100%"/>
@@ -35,7 +60,7 @@ The `ALoaderPawn` demonstrates a significant extension of the Chaos Modular Vehi
 - **LoaderSimComponent**: An extension of `UModularVehicleBaseComponent` that manages the core vehicle dynamics while coordinating the custom arm and bucket sub-modules.
 - **Hierarchical Simulation**: Showcases complex part-to-part physics relationships and animation synchronization between the Physics Thread and Game Thread.
 
-### 2. Mining Truck
+### 3. Mining Truck
 This additional pawn is a second **Chaos Modular Vehicle–based implementation** designed to more closely resemble **real-life industrial machinery** rather than arcade-style vehicles.
 
 <img src="https://raw.githubusercontent.com/cem-akkaya/NetworkedPhysics/refs/heads/master/Source/4.gif" alt="networked-physics-splash" width="100%"/>
@@ -48,7 +73,7 @@ This additional pawn is a second **Chaos Modular Vehicle–based implementation*
 
 This pawn exists primarily as a **physics validation case**, ensuring that the modular vehicle and arm systems behave correctly under heavy loads and realistic drivetrain constraints.
 
-### 3. Wrecking Ball Controller (MyPhysicsPawn)
+### 4. Wrecking Ball Controller (MyPhysicsPawn)
 This component implements the manual asynchronous networked physics logic detailed in the community tutorial, serving as a robust base for state synchronization.
 
 <img src="https://raw.githubusercontent.com/cem-akkaya/NetworkedPhysics/refs/heads/master/Source/2.gif" alt="networked-physics-splash" width="100%"/>
@@ -57,6 +82,7 @@ This component implements the manual asynchronous networked physics logic detail
 - **Synchronization Logic**: Demonstrates reliable input and state replication across the network with client-side prediction and server reconciliation.
 
 ---
+<img src="https://raw.githubusercontent.com/cem-akkaya/NetworkedPhysics/refs/heads/master/Source/1.gif" alt="networked-physics-splash" width="100%"/>
 
 ## Technical Flow
 
