@@ -55,6 +55,8 @@ namespace Chaos
 			, CurrentAngle(0.0f)
 			, CurrentAngularVel(0.0f)
 			, bInitialized(false)
+			, LastSyncedAngle(0.0f)
+			, CollisionSyncAccumulator(0.0f)
 		{}
 
 		virtual void Simulate(IPhysicsProxyBase* Proxy, Chaos::FPBDRigidParticleHandle* ParticleHandle, float DeltaTime, const FAllInputs& Inputs, FSimModuleTree& VehicleModuleSystem) override;
@@ -76,6 +78,11 @@ namespace Chaos
 		float CurrentAngle;
 		float CurrentAngularVel;
 		bool bInitialized;
+		// Throttle expensive collision/geometry syncs to avoid stalls
+		float LastSyncedAngle;
+		float CollisionSyncAccumulator; // seconds
+		static constexpr float CollisionSyncInterval = 0.05f; // 20 Hz max
+		static constexpr float CollisionAngleEpsDeg = 0.25f; // only if changed visibly
 	};
 
 	/** Module that handles things attached to the Arm */

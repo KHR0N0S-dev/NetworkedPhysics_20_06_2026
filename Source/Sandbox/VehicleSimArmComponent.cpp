@@ -43,6 +43,7 @@ namespace Chaos
 		}
 
 		// 2. Handle User Input
+		CollisionSyncAccumulator += DeltaTime;
 		const float InputValue = static_cast<float>(Inputs.GetControls().GetFloat(Setup().InputName));
 		if (FMath::Abs(InputValue) > 0.01f)
 		{
@@ -181,24 +182,26 @@ namespace Chaos
 				}
 			}
 
-			// 6. Force Collision Update for the Cluster
-			// This is critical! Without this, the bucket moves visually but its collision
-			// representation stays at the start, making it unable to "collect" anything.
+			// 6. Request lightweight geometry update (throttled) instead of forcing a full flush every tick
 			if (ChildrenToProcess.Num() > 0)
 			{
-				if (FPBDRigidsSolver* Solver = CUProxy->GetSolver<FPBDRigidsSolver>())
+				const bool bAngleChanged = FMath::Abs(CurrentAngle - LastSyncedAngle) > CollisionAngleEpsDeg;
+				if (bAngleChanged && CollisionSyncAccumulator >= CollisionSyncInterval)
 				{
-					if (FPBDRigidsEvolutionGBF* Evolution = static_cast<FPBDRigidsEvolutionGBF*>(Solver->GetEvolution()))
+					if (FPBDRigidsSolver* Solver = CUProxy->GetSolver<FPBDRigidsSolver>())
 					{
-						FClusterUnionManager& ClusterUnionManager = Evolution->GetRigidClustering().GetClusterUnionManager();
-						
-						// Process all updates (including geometry refresh) immediately
-						ClusterUnionManager.HandleDeferredClusterUnionUpdateProperties();
-						
-						static int32 LogCounter = 0;
-						if (LogCounter++ % 100 == 0)
+						if (FPBDRigidsEvolutionGBF* Evolution = static_cast<FPBDRigidsEvolutionGBF*>(Solver->GetEvolution()))
 						{
-							UE_LOG(LogTemp, Display, TEXT("Component: ARM SIM | Authoritative Collision Update for Movement"));
+							FClusterUnionManager& ClusterUnionManager = Evolution->GetRigidClustering().GetClusterUnionManager();
+							// Ensure the union processes incremental geometry regeneration for this cluster soon
+							ClusterUnionManager.RequestDeferredClusterPropertiesUpdate(CUProxy->GetClusterUnionIndex(), EUpdateClusterUnionPropertiesFlags::IncrementalGenerateGeometry);
+							LastSyncedAngle = CurrentAngle;
+							CollisionSyncAccumulator = 0.0f;
+							static int32 LogCounter = 0;
+							if ((LogCounter++ % 60) == 0)
+							{
+								UE_LOG(LogTemp, Verbose, TEXT("Component: ARM SIM | Deferred incremental geometry update requested"));
+							}
 						}
 					}
 				}
