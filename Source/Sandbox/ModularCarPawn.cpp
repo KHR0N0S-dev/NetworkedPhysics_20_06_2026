@@ -308,11 +308,8 @@ AModularCarPawn::AModularCarPawn()
 		NetworkPhysicsComponent->SetNetAddressable();
 		NetworkPhysicsComponent->SetIsReplicated(true);
 
-		// Drive the body through resimulation-based physics replication. Without this the actor
-		// stays on EPhysicsReplicationMode::Default, where replicated targets are snapped onto the
-		// body each update instead of being reconciled by prediction - that snapping is the network
-		// jitter. Resimulation rewinds & replays from the corrected state, so motion stays smooth.
-		SetPhysicsReplicationMode(EPhysicsReplicationMode::Resimulation);
+		// Replication mode is applied per-role in ApplyNetworkPhysicsReplicationMode() — must be set
+		// before NetworkPhysicsComponent::BeginPlay marshals mode to the physics thread.
 
 		static const FName NetworkPhysicsSettingsComponentName(TEXT("NetworkPhysicsSettingsComponent"));
 		NetworkPhysicsSettingsComponent = CreateDefaultSubobject<UNetworkPhysicsSettingsComponent>(NetworkPhysicsSettingsComponentName);
@@ -388,14 +385,16 @@ void AModularCarPawn::BeginPlay()
 		Body->SetVisibility(false);
 	}
 	ApplyBodyVisual();
+	ApplyNetworkPhysicsReplicationMode();
+	EnsureNetworkPhysicsHistory();
 	ScheduleRefreshPhysicsBindings();
 
 	RefreshDriveTuningFromWheels();
 
-	UE_LOG(LogTemp, Warning, TEXT("CARSETUP | Role=%d LC=%d Sim=%d Grav=%d Mass=%.0f Wheels=%d Net=%d EngineForce=%.0f"),
-		(int32)GetLocalRole(), IsLocallyControlled() ? 1 : 0,
+	UE_LOG(LogTemp, Warning, TEXT("CARSETUP | Role=%d LC=%d RepMode=%d Sim=%d Grav=%d Mass=%.0f Wheels=%d Net=%d Hist=%d EngineForce=%.0f"),
+		(int32)GetLocalRole(), IsLocallyControlled() ? 1 : 0, (int32)GetPhysicsReplicationMode(),
 		Body->IsSimulatingPhysics() ? 1 : 0, Body->IsGravityEnabled() ? 1 : 0,
-		Body->GetMass(), Wheels.Num(), NetworkPhysicsComponent ? 1 : 0,
+		Body->GetMass(), Wheels.Num(), NetworkPhysicsComponent ? 1 : 0, bNetworkPhysicsHistoryCreated ? 1 : 0,
 		CarAsync ? CarAsync->EngineForceTotal : 0.0f);
 
 	// Diagnostics: did the cosmetic car load and get applied, and are the proxies hidden?
@@ -595,6 +594,52 @@ void AModularCarPawn::ApplyReplicatedWheelLayout()
 	RefreshDriveTuningFromWheels();
 }
 
+void AModularCarPawn::ApplyNetworkPhysicsReplicationMode()
+{
+	if (!UPhysicsSettings::Get()->PhysicsPrediction.bEnablePhysicsPrediction)
+	{
+		return;
+	}
+
+	const ENetRole LocalRole = GetLocalRole();
+	if (LocalRole == ROLE_SimulatedProxy)
+	{
+		// Remote cars on clients follow server targets via predictive interpolation, not resim.
+		SetPhysicsReplicationMode(EPhysicsReplicationMode::PredictiveInterpolation);
+	}
+	else if (LocalRole == ROLE_Authority || LocalRole == ROLE_AutonomousProxy)
+	{
+		SetPhysicsReplicationMode(EPhysicsReplicationMode::Resimulation);
+	}
+}
+
+void AModularCarPawn::EnsureNetworkPhysicsHistory()
+{
+	if (bNetworkPhysicsHistoryCreated || !CarAsync || !NetworkPhysicsComponent)
+	{
+		return;
+	}
+
+	// Compound body must exist (wheels welded) before registering network physics history.
+	if (ReplicatedWheelSpecs.Num() == 0 || Wheels.Num() == 0)
+	{
+		return;
+	}
+
+	ApplyNetworkPhysicsReplicationMode();
+	NetworkPhysicsComponent->CreateDataHistory<FNetInputModularCar, FNetStateModularCar>(CarAsync);
+	bNetworkPhysicsHistoryCreated = true;
+	RefreshPhysicsBindings();
+}
+
+void AModularCarPawn::PostNetReceiveRole()
+{
+	Super::PostNetReceiveRole();
+	ApplyNetworkPhysicsReplicationMode();
+	EnsureNetworkPhysicsHistory();
+	ScheduleRefreshPhysicsBindings();
+}
+
 void AModularCarPawn::ScheduleRefreshPhysicsBindings()
 {
 	if (!GetWorld() || bPhysicsRefreshScheduled)
@@ -633,6 +678,10 @@ void AModularCarPawn::RefreshPhysicsBindings()
 	if (NetworkPhysicsComponent)
 	{
 		NetworkPhysicsComponent->SetPhysicsObject(BodyHandle);
+		if (bNetworkPhysicsHistoryCreated)
+		{
+			NetworkPhysicsComponent->AddDataHistory();
+		}
 	}
 
 	if (bDriveRole || HasAuthority())
@@ -645,6 +694,7 @@ void AModularCarPawn::OnRep_ReplicatedWheelSpecs()
 {
 	InitializeChassisPhysics();
 	ApplyReplicatedWheelLayout();
+	EnsureNetworkPhysicsHistory();
 }
 
 bool AModularCarPawn::AddSymmetricWheelPairAuthority()
@@ -797,11 +847,7 @@ void AModularCarPawn::PostInitializeComponents()
 						CarAsync->RestSpeedDeadzone = RestSpeedDeadzone;
 						CarAsync->bApplyDriveForces = ShouldApplyDriveForces();
 
-						if (NetworkPhysicsComponent)
-						{
-							NetworkPhysicsComponent->CreateDataHistory<FNetInputModularCar, FNetStateModularCar>(CarAsync);
-							RefreshPhysicsBindings();
-						}
+						EnsureNetworkPhysicsHistory();
 					}
 				}
 			}
@@ -1287,8 +1333,13 @@ void AModularCarPawn::RunSelfTest(float DeltaTime)
 				&& (CollTargetJitter <= JitterTol)
 				&& (CollTargetMaxMove >= TargetMoveTol)
 				&& (SepGain >= SepGainTol);
-			UE_LOG(LogTemp, Warning, TEXT("SELFTEST NETCOLLISION | HaveTarget=%d PeakSpeed=%.0f (<=%.0f) MinSep=%.0f (>=%.0f) TargetJitter=%.1f (<=%.0f) TargetMove=%.0f (>=%.0f) SepGainOnRetreat=%.0f (>=%.0f) => %s"),
-				bHaveTarget ? 1 : 0, CollPeakSpeed, SpeedTol, CollMinSep, SepTol, CollTargetJitter, JitterTol, CollTargetMaxMove, TargetMoveTol, SepGain, SepGainTol, bPass ? TEXT("PASS") : TEXT("FAIL"));
+			const int32 TargetRole = CollTarget ? (int32)CollTarget->GetLocalRole() : -1;
+			const int32 TargetRepMode = CollTarget ? (int32)CollTarget->GetPhysicsReplicationMode() : -1;
+			const bool bSimProxyOk = CollTarget && (CollTarget->GetLocalRole() == ROLE_SimulatedProxy)
+				&& (CollTarget->GetPhysicsReplicationMode() == EPhysicsReplicationMode::PredictiveInterpolation);
+			const bool bPassWithProxy = bPass && bSimProxyOk;
+			UE_LOG(LogTemp, Warning, TEXT("SELFTEST NETCOLLISION | HaveTarget=%d TargetRole=%d TargetRepMode=%d PeakSpeed=%.0f (<=%.0f) MinSep=%.0f (>=%.0f) TargetJitter=%.1f (<=%.0f) TargetMove=%.0f (>=%.0f) SepGainOnRetreat=%.0f (>=%.0f) => %s"),
+				bHaveTarget ? 1 : 0, TargetRole, TargetRepMode, CollPeakSpeed, SpeedTol, CollMinSep, SepTol, CollTargetJitter, JitterTol, CollTargetMaxMove, TargetMoveTol, SepGain, SepGainTol, bPassWithProxy ? TEXT("PASS") : TEXT("FAIL"));
 			UE_LOG(LogTemp, Warning, TEXT("SELFTEST DONE"));
 			FPlatformMisc::RequestExit(false);
 		}

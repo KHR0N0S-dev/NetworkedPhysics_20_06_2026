@@ -200,6 +200,7 @@ public:
 	virtual void PawnClientRestart() override;
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
+	virtual void PostNetReceiveRole() override;
 
 	//-------------------- Runtime build API --------------------
 
@@ -339,6 +340,8 @@ private:
 	void ApplyReplicatedWheelLayout();
 	void RefreshPhysicsBindings();
 	void ScheduleRefreshPhysicsBindings();
+	void ApplyNetworkPhysicsReplicationMode();
+	void EnsureNetworkPhysicsHistory();
 	void InitializeDefaultSymmetricWheelSpecs();
 	FVector GetSymmetricPairWheelLocation(int32 PairIndex, bool bLeftSide) const;
 	bool AddSymmetricWheelPairAuthority();
@@ -361,6 +364,7 @@ private:
 	FModularCarAsync* CarAsync = nullptr;
 	bool bChassisPhysicsInitialized = false;
 	bool bPhysicsRefreshScheduled = false;
+	bool bNetworkPhysicsHistoryCreated = false;
 
 	UPROPERTY()
 	TObjectPtr<UNetworkPhysicsComponent> NetworkPhysicsComponent = nullptr;
