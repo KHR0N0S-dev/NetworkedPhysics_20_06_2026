@@ -38,7 +38,7 @@
 static TAutoConsoleVariable<int32> CVarCarSelfTest(
 	TEXT("car.SelfTest"),
 	0,
-	TEXT("Headless self-test: 1=drive, 2=rest, 3=cosmetic-mesh, 4=collision, 5=adversarial collision, 6=networked collision (server+client), 7=dual-client head-on, 8=add-wheel sleep regression; logs telemetry then quits."),
+	TEXT("Headless self-test: 1=drive, 2=rest, 3=cosmetic-mesh, 4=collision, 5=adversarial collision, 6=networked collision (server+client), 7=dual-client head-on, 8=add-wheel sleep regression, 9=remote drive (server throttle, client sim-proxy); logs telemetry then quits."),
 	ECVF_Default);
 
 //----------------------------------------------------
@@ -237,9 +237,10 @@ AModularCarPawn::AModularCarPawn()
 {
 	PrimaryActorTick.bCanEverTick = true;
 	bReplicates = true;
-	SetReplicateMovement(false);
-	// Movement/state sync is handled by the network physics component (prediction + reconciliation),
-	// not by ordinary movement replication. The game mode possesses each player's pawn.
+	// ReplicateMovement must stay enabled: server GatherCurrentMovement() publishes physics state
+	// into ReplicatedMovement for sim-proxies (PostNetReceivePhysicState -> PI). Input prediction
+	// and resimulation remain on UNetworkPhysicsComponent. Disabling movement replication freezes
+	// remote cars on clients because they never receive SetRigidBodyReplicatedTarget updates.
 	SpawnCollisionHandlingMethod = ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButAlwaysSpawn;
 
 	static ConstructorHelpers::FObjectFinder<UStaticMesh> CubeFinder(TEXT("/Engine/BasicShapes/Cube.Cube"));
@@ -681,6 +682,18 @@ void AModularCarPawn::RefreshPhysicsBindings()
 		if (bNetworkPhysicsHistoryCreated)
 		{
 			NetworkPhysicsComponent->AddDataHistory();
+		}
+	}
+
+	// Server must cache physics state so GatherCurrentMovement can replicate to sim-proxies.
+	if (HasAuthority())
+	{
+		if (UWorld* World = GetWorld())
+		{
+			if (FPhysScene_Chaos* Scene = static_cast<FPhysScene_Chaos*>(World->GetPhysicsScene()))
+			{
+				Scene->RegisterForReplicationCache(Body);
+			}
 		}
 	}
 
@@ -1340,6 +1353,125 @@ void AModularCarPawn::RunSelfTest(float DeltaTime)
 			const bool bPassWithProxy = bPass && bSimProxyOk;
 			UE_LOG(LogTemp, Warning, TEXT("SELFTEST NETCOLLISION | HaveTarget=%d TargetRole=%d TargetRepMode=%d PeakSpeed=%.0f (<=%.0f) MinSep=%.0f (>=%.0f) TargetJitter=%.1f (<=%.0f) TargetMove=%.0f (>=%.0f) SepGainOnRetreat=%.0f (>=%.0f) => %s"),
 				bHaveTarget ? 1 : 0, TargetRole, TargetRepMode, CollPeakSpeed, SpeedTol, CollMinSep, SepTol, CollTargetJitter, JitterTol, CollTargetMaxMove, TargetMoveTol, SepGain, SepGainTol, bPassWithProxy ? TEXT("PASS") : TEXT("FAIL"));
+			UE_LOG(LogTemp, Warning, TEXT("SELFTEST DONE"));
+			FPlatformMisc::RequestExit(false);
+		}
+		return;
+	}
+
+	// Mode 9: server drives a spawned target (authority); client watches sim-proxy follow without contact.
+	if (Mode == 9)
+	{
+		const UWorld* World = GetWorld();
+		const bool bNetworked = World && (World->GetNetMode() != NM_Standalone);
+		if (!bNetworked)
+		{
+			return;
+		}
+
+		if (HasAuthority() && bIsNetTarget)
+		{
+			ThrottleInput_External = 1.0f;
+			SteerInput_External = 0.0f;
+			HandbrakeInput_External = 0.0f;
+			if (CarAsync)
+			{
+				if (FAsyncInputModularCar* AsyncInput = CarAsync->GetProducerInputData_External())
+				{
+					AsyncInput->Throttle = 1.0f;
+					AsyncInput->Steer = 0.0f;
+					AsyncInput->Handbrake = 0.0f;
+				}
+			}
+			return;
+		}
+
+		if (HasAuthority())
+		{
+			if (bIsNetTarget || GetController() == nullptr)
+			{
+				return;
+			}
+			NetTime += DeltaTime;
+			if (!bNetServerSpawned && NetTime > 1.5f)
+			{
+				bNetServerSpawned = true;
+				if (UWorld* W = GetWorld())
+				{
+					FActorSpawnParameters Params;
+					Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+					const FVector Ahead = GetActorLocation() + GetActorForwardVector() * 1200.0f;
+					if (AModularCarPawn* T = W->SpawnActor<AModularCarPawn>(GetClass(), Ahead, GetActorRotation(), Params))
+					{
+						T->bIsNetTarget = true;
+						UE_LOG(LogTemp, Warning, TEXT("SELFTEST NET | SERVER spawned drive-target %s at %s"), *T->GetName(), *Ahead.ToString());
+					}
+				}
+			}
+			return;
+		}
+
+		if (!IsLocallyControlled())
+		{
+			return;
+		}
+
+		if (!CollTarget)
+		{
+			for (TActorIterator<AModularCarPawn> It(GetWorld()); It; ++It)
+			{
+				if (*It != this && !It->IsLocallyControlled()) { CollTarget = *It; break; }
+			}
+		}
+
+		if (!bSelfTestStarted)
+		{
+			bSelfTestStarted = true;
+			SelfTestTime = 0.0f;
+			SelfTestLogAccum = 1.0f;
+			CollTargetMaxMove = 0.0f;
+			bCollTargetInitialPosSet = false;
+			UE_LOG(LogTemp, Warning, TEXT("SELFTEST START | Mode=9 (REMOTE-DRIVE) target=%s"),
+				CollTarget ? *CollTarget->GetName() : TEXT("WAITING"));
+		}
+
+		SelfTestTime += DeltaTime;
+		SelfTestLogAccum += DeltaTime;
+		ThrottleInput_External = 0.0f;
+		SteerInput_External = 0.0f;
+		HandbrakeInput_External = 0.0f;
+
+		if (CollTarget)
+		{
+			const FVector B = CollTarget->GetActorLocation();
+			if (!bCollTargetInitialPosSet)
+			{
+				CollTargetInitialPos = B;
+				bCollTargetInitialPosSet = true;
+			}
+			CollTargetMaxMove = FMath::Max(CollTargetMaxMove, (float)FVector::Dist(B, CollTargetInitialPos));
+		}
+
+		if (SelfTestLogAccum >= 0.5f)
+		{
+			SelfTestLogAccum = 0.0f;
+			const FVector B = CollTarget ? CollTarget->GetActorLocation() : FVector::ZeroVector;
+			UE_LOG(LogTemp, Warning, TEXT("SELFTEST t=%.1f (observe) | Target=(%.0f,%.0f,%.0f) Move=%.0f Role=%d RepMode=%d"),
+				SelfTestTime, B.X, B.Y, B.Z, CollTargetMaxMove,
+				CollTarget ? (int32)CollTarget->GetLocalRole() : -1,
+				CollTarget ? (int32)CollTarget->GetPhysicsReplicationMode() : -1);
+		}
+
+		if (SelfTestTime >= 8.0f)
+		{
+			const float TargetMoveTol = 120.0f;
+			const int32 TargetRole = CollTarget ? (int32)CollTarget->GetLocalRole() : -1;
+			const int32 TargetRepMode = CollTarget ? (int32)CollTarget->GetPhysicsReplicationMode() : -1;
+			const bool bSimProxyOk = CollTarget && (CollTarget->GetLocalRole() == ROLE_SimulatedProxy)
+				&& (CollTarget->GetPhysicsReplicationMode() == EPhysicsReplicationMode::PredictiveInterpolation);
+			const bool bPass = CollTarget && bSimProxyOk && (CollTargetMaxMove >= TargetMoveTol);
+			UE_LOG(LogTemp, Warning, TEXT("SELFTEST REMOTEDRIVE | HaveTarget=%d TargetRole=%d TargetRepMode=%d TargetMove=%.0f (>=%.0f) => %s"),
+				CollTarget ? 1 : 0, TargetRole, TargetRepMode, CollTargetMaxMove, TargetMoveTol, bPass ? TEXT("PASS") : TEXT("FAIL"));
 			UE_LOG(LogTemp, Warning, TEXT("SELFTEST DONE"));
 			FPlatformMisc::RequestExit(false);
 		}
