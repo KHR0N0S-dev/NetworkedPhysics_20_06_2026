@@ -327,6 +327,7 @@ private:
 	void RunSelfTest(float DeltaTime);
 	bool ShouldApplyDriveForces() const;
 	void UpdateAsyncDriveForcesFlag();
+	void KeepDrivePhysicsAwake();
 
 	void EnsureInputAssets();
 	void Input_Throttle(const FInputActionValue& Value);
@@ -414,6 +415,9 @@ private:
 	bool bSelfTestWheelPairAdded = false; // mode 8: add-wheel-then-drive sleep regression
 	FVector SelfTestDriveStartPos = FVector::ZeroVector;
 	bool bSelfTestDrivePhase = false;
+	FVector SelfTestResumeDriveStartPos = FVector::ZeroVector;
+	float SelfTestResumePeakSpeed = 0.0f;
+	bool bSelfTestResumeDrivePhase = false;
 
 	// Collision self-test (mode 4): ram a second spawned car and check the physics stays sane.
 	UPROPERTY()
