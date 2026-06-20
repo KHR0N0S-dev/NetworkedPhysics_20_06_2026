@@ -581,10 +581,19 @@ void AModularCarPawn::RefreshPhysicsBindings()
 		return;
 	}
 
+	const Chaos::FConstPhysicsObjectHandle BodyHandle = Body->GetPhysicsObjectByName(NAME_None);
+
 	if (CarAsync)
 	{
-		CarAsync->PhysicsObject = Body->GetPhysicsObjectByName(NAME_None);
-		ApplyNeverSleepToParticle(CarAsync->PhysicsObject);
+		CarAsync->PhysicsObject = BodyHandle;
+		ApplyNeverSleepToParticle(BodyHandle);
+	}
+
+	// Welding wheels rebuilds the compound body; NetworkPhysicsComponent must track the new handle
+	// or sim-proxies stop receiving replicated motion (frozen remote cars).
+	if (NetworkPhysicsComponent)
+	{
+		NetworkPhysicsComponent->SetPhysicsObject(BodyHandle);
 	}
 
 	Body->WakeAllRigidBodies();
@@ -1146,7 +1155,10 @@ void AModularCarPawn::RunSelfTest(float DeltaTime)
 			CollMinSep = BIG_NUMBER;
 			CollSepRamEnd = -1.0f;
 			CollTargetJitter = 0.0f;
+			CollTargetMaxMove = 0.0f;
 			bCollTargetPosInit = false;
+			CollTargetInitialPos = FVector::ZeroVector;
+			bCollTargetInitialPosSet = false;
 			SelfTestStartPos = Body->GetComponentLocation();
 			UE_LOG(LogTemp, Warning, TEXT("SELFTEST START | Mode=6 (NETCOLLISION) netmode=%d target=%s"),
 				(int32)(World ? World->GetNetMode() : NM_Standalone), CollTarget ? *CollTarget->GetName() : TEXT("WAITING"));
@@ -1162,6 +1174,17 @@ void AModularCarPawn::RunSelfTest(float DeltaTime)
 		ThrottleInput_External = bRetreat ? -1.0f : (bRam ? 1.0f : 0.0f);
 		SteerInput_External = 0.0f;
 		HandbrakeInput_External = 0.0f;
+
+		if (bHaveTarget)
+		{
+			const FVector B = CollTarget->GetActorLocation();
+			if (!bCollTargetInitialPosSet)
+			{
+				CollTargetInitialPos = B;
+				bCollTargetInitialPosSet = true;
+			}
+			CollTargetMaxMove = FMath::Max(CollTargetMaxMove, (float)FVector::Dist(B, CollTargetInitialPos));
+		}
 
 		if (bHaveTarget && (bRam || bRetreat))
 		{
@@ -1202,13 +1225,15 @@ void AModularCarPawn::RunSelfTest(float DeltaTime)
 			const float SepTol = 150.0f;       // interpenetration if closer than this
 			const float JitterTol = 60.0f;     // sim-proxy frame jitter (sticking/fighting) cap
 			const float SepGainTol = 100.0f;   // must pull apart on retreat (no clinging)
+			const float TargetMoveTol = 15.0f; // sim-proxy must follow server push (frozen if ~0)
 			const bool bPass = bHaveTarget && bFinite
 				&& (CollPeakSpeed <= SpeedTol)
 				&& (CollMinSep >= SepTol)
 				&& (CollTargetJitter <= JitterTol)
+				&& (CollTargetMaxMove >= TargetMoveTol)
 				&& (SepGain >= SepGainTol);
-			UE_LOG(LogTemp, Warning, TEXT("SELFTEST NETCOLLISION | HaveTarget=%d PeakSpeed=%.0f (<=%.0f) MinSep=%.0f (>=%.0f) TargetJitter=%.1f (<=%.0f) SepGainOnRetreat=%.0f (>=%.0f) => %s"),
-				bHaveTarget ? 1 : 0, CollPeakSpeed, SpeedTol, CollMinSep, SepTol, CollTargetJitter, JitterTol, SepGain, SepGainTol, bPass ? TEXT("PASS") : TEXT("FAIL"));
+			UE_LOG(LogTemp, Warning, TEXT("SELFTEST NETCOLLISION | HaveTarget=%d PeakSpeed=%.0f (<=%.0f) MinSep=%.0f (>=%.0f) TargetJitter=%.1f (<=%.0f) TargetMove=%.0f (>=%.0f) SepGainOnRetreat=%.0f (>=%.0f) => %s"),
+				bHaveTarget ? 1 : 0, CollPeakSpeed, SpeedTol, CollMinSep, SepTol, CollTargetJitter, JitterTol, CollTargetMaxMove, TargetMoveTol, SepGain, SepGainTol, bPass ? TEXT("PASS") : TEXT("FAIL"));
 			UE_LOG(LogTemp, Warning, TEXT("SELFTEST DONE"));
 			FPlatformMisc::RequestExit(false);
 		}

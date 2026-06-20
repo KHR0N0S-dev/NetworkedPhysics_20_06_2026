@@ -422,7 +422,10 @@ private:
 	bool bNetServerSpawned = false;   // server: target spawned once
 	float NetTime = 0.0f;             // server-side timer for deferred spawn
 	float CollTargetJitter = 0.0f;    // client: peak frame-to-frame move of the sim-proxy target
+	float CollTargetMaxMove = 0.0f;   // client: max displacement from initial replicated target pos
 	FVector CollPrevTargetPos = FVector::ZeroVector;
+	FVector CollTargetInitialPos = FVector::ZeroVector;
+	bool bCollTargetInitialPosSet = false;
 	bool bCollTargetPosInit = false;
 
 	// Mode 7: two clients, both predicted — head-on collision then retreat (mutual prediction).
