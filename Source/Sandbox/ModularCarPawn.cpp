@@ -3,6 +3,9 @@
 #include "ModularCarPawn.h"
 
 #include "Components/StaticMeshComponent.h"
+#include "Components/SkeletalMeshComponent.h"
+#include "Engine/SkeletalMesh.h"
+#include "Animation/AnimationAsset.h"
 #include "Components/InputComponent.h"
 #include "GameFramework/SpringArmComponent.h"
 #include "Camera/CameraComponent.h"
@@ -31,7 +34,7 @@
 static TAutoConsoleVariable<int32> CVarCarSelfTest(
 	TEXT("car.SelfTest"),
 	0,
-	TEXT("Headless self-test: 1 = drive in a circle, 2 = rest-stability check; logs telemetry then quits."),
+	TEXT("Headless self-test: 1 = drive in a circle, 2 = rest-stability check, 3 = cosmetic-mesh check; logs telemetry then quits."),
 	ECVF_Default);
 
 //----------------------------------------------------
@@ -175,12 +178,19 @@ void FModularCarAsync::OnPreSimulate_Internal()
 		ParticleHandle->AddForce(Force, true);
 	}
 
-	if (FMath::Abs(Steer) > 0.01f && MaxYawAccelRad > 0.0f)
+	// Steering = command a target yaw rate directly (arcade model). Applying a torque through the
+	// welded body's (large, hard-to-estimate) moment of inertia barely turned the car; driving the
+	// yaw angular velocity toward a target gives a predictable, tunable "how sharp it turns" knob
+	// (MaxYawRate, deg/s) and stays deterministic for prediction/resimulation. Scaled by speed so
+	// the car only turns while rolling and reverses naturally in reverse.
+	if (FMath::Abs(Steer) > 0.01f && MaxYawRateRad > 0.0f)
 	{
 		const Chaos::FReal SpeedFrac = FMath::Clamp(FwdVel / FMath::Max((Chaos::FReal)SteerRefSpeed, (Chaos::FReal)1.0), (Chaos::FReal)-1.0, (Chaos::FReal)1.0);
-		// torque = inertia * angular acceleration (AddTorque takes a torque, not an accel).
-		const Chaos::FReal YawTorque = Steer * SpeedFrac * MaxYawAccelRad * YawInertia;
-		ParticleHandle->AddTorque(Up * YawTorque, true);
+		const Chaos::FReal TargetYaw = Steer * SpeedFrac * MaxYawRateRad;
+		Chaos::FVec3 W = ParticleHandle->GetW();
+		// Converge quickly toward the target yaw rate; leave pitch/roll (tilt) to the solver.
+		W.Z = FMath::Lerp(W.Z, TargetYaw, (Chaos::FReal)0.5);
+		ParticleHandle->SetW(W);
 	}
 }
 
@@ -200,6 +210,9 @@ AModularCarPawn::AModularCarPawn()
 	static ConstructorHelpers::FObjectFinder<UStaticMesh> CylinderFinder(TEXT("/Engine/BasicShapes/Cylinder.Cylinder"));
 	CubeMesh = CubeFinder.Succeeded() ? CubeFinder.Object : nullptr;
 	CylinderMesh = CylinderFinder.Succeeded() ? CylinderFinder.Object : nullptr;
+	// The cosmetic car (skeletal SKM_SportsCar) is loaded at runtime in BeginPlay, not here:
+	// the project's own SportsCar_SM static meshes are saved with a too-new package version and
+	// will not load in this engine build, so we use the engine plugin's native skeletal car instead.
 
 	// Chassis = the simulating root rigid body.
 	Body = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("Body"));
@@ -230,6 +243,19 @@ AModularCarPawn::AModularCarPawn()
 	Camera = CreateDefaultSubobject<UCameraComponent>(TEXT("Camera"));
 	Camera->SetupAttachment(SpringArm, USpringArmComponent::SocketName);
 
+	// Cosmetic car (skeletal SKM_SportsCar - body + wheels in one mesh, rendered in ref pose),
+	// overlaid on the collision cube. Absolute scale so the chassis' non-uniform scale (sized from
+	// BodyExtent) never squashes the art; no collision (the cube + cylinders handle that).
+	BodyVisual = CreateDefaultSubobject<USkeletalMeshComponent>(TEXT("BodyVisual"));
+	BodyVisual->SetupAttachment(Body);
+	BodyVisual->SetUsingAbsoluteScale(true);
+	BodyVisual->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	BodyVisual->SetCollisionProfileName(TEXT("NoCollision"));
+	BodyVisual->CanCharacterStepUpOn = ECB_No;
+	BodyVisual->SetGenerateOverlapEvents(false);
+	BodyVisual->SetAnimationMode(EAnimationMode::AnimationSingleNode);
+	BodyVisual->PrimaryComponentTick.bCanEverTick = false;
+
 	// Networked physics component (only when physics prediction is enabled in project settings).
 	if (UPhysicsSettings::Get()->PhysicsPrediction.bEnablePhysicsPrediction)
 	{
@@ -253,6 +279,15 @@ void AModularCarPawn::BeginPlay()
 	if (!Body)
 	{
 		return;
+	}
+
+	// Load the cosmetic car at runtime (content is mounted by now; FObjectFinder at CDO time is
+	// unreliable for plugin/game content). SKM_SportsCar is the engine's native 5.7 skeletal car
+	// (body + wheels); the project's own SportsCar_SM is unusable here (too-new package version).
+	if (bUseVisualMeshes && !CarBodyMesh)
+	{
+		CarBodyMesh = LoadObject<USkeletalMesh>(nullptr, TEXT("/ChaosModularVehicleExamples/Models/SportsCar/SKM_SportsCar.SKM_SportsCar"));
+		UE_LOG(LogTemp, Warning, TEXT("VISUALLOAD | SKM_SportsCar=%s"), CarBodyMesh ? TEXT("OK") : TEXT("FAIL"));
 	}
 
 	Body->SetRelativeScale3D(BodyExtent / 100.0f);
@@ -290,9 +325,30 @@ void AModularCarPawn::BeginPlay()
 
 	SettleOntoGround();
 
+	// Hide the collision cube once the car body art is in place (collision/simulation unaffected).
+	if (bUseVisualMeshes && CarBodyMesh)
+	{
+		Body->SetVisibility(false);
+	}
+	ApplyBodyVisual();
+
 	UE_LOG(LogTemp, Warning, TEXT("CARSETUP | Sim=%d Grav=%d Mass=%.0f Wheels=%d Net=%d"),
 		Body->IsSimulatingPhysics() ? 1 : 0, Body->IsGravityEnabled() ? 1 : 0,
 		Body->GetMass(), Wheels.Num(), NetworkPhysicsComponent ? 1 : 0);
+
+	// Diagnostics: did the cosmetic car load and get applied, and are the proxies hidden?
+	const USkeletalMesh* BV = BodyVisual ? BodyVisual->GetSkeletalMeshAsset() : nullptr;
+	int32 CylVisible = 0;
+	for (const FCarWheel& W : Wheels)
+	{
+		if (W.Mesh && W.Mesh->IsVisible()) { ++CylVisible; }
+	}
+	UE_LOG(LogTemp, Warning, TEXT("VISUALCHECK | UseVis=%d CarBodyMesh=%s BodyVisualMesh=%s BodyHidden=%d CylindersVisible=%d/%d"),
+		bUseVisualMeshes ? 1 : 0,
+		CarBodyMesh ? *CarBodyMesh->GetName() : TEXT("NULL"),
+		BV ? *BV->GetName() : TEXT("NULL"),
+		(Body && !Body->IsVisible()) ? 1 : 0,
+		CylVisible, Wheels.Num());
 }
 
 void AModularCarPawn::SettleOntoGround()
@@ -358,7 +414,38 @@ UStaticMeshComponent* AModularCarPawn::CreateWheelMesh(const FVector& RelLoc, fl
 	{
 		Comp->SetPhysMaterialOverride(ChassisPhysMaterial);
 	}
+	// The cylinder is the support/collision; hide it once the cosmetic car covers everything.
+	if (bUseVisualMeshes && CarBodyMesh)
+	{
+		Comp->SetVisibility(false);
+	}
 	return Comp;
+}
+
+void AModularCarPawn::ApplyBodyVisual()
+{
+	if (!BodyVisual)
+	{
+		return;
+	}
+	const bool bShow = bUseVisualMeshes && (CarBodyMesh != nullptr);
+	BodyVisual->SetVisibility(bShow);
+	if (!bShow)
+	{
+		return;
+	}
+	BodyVisual->SetSkeletalMeshAsset(CarBodyMesh);
+	BodyVisual->SetUsingAbsoluteScale(true);
+	BodyVisual->SetWorldScale3D(BodyVisualScale);
+
+	// Relative offset is scaled by the chassis' non-uniform scale, so pre-divide to land where asked.
+	const FVector S = Body ? Body->GetRelativeScale3D() : FVector::OneVector;
+	const FVector SafeS(
+		FMath::Abs(S.X) > KINDA_SMALL_NUMBER ? S.X : 1.0f,
+		FMath::Abs(S.Y) > KINDA_SMALL_NUMBER ? S.Y : 1.0f,
+		FMath::Abs(S.Z) > KINDA_SMALL_NUMBER ? S.Z : 1.0f);
+	BodyVisual->SetRelativeLocation(BodyVisualOffset / SafeS);
+	BodyVisual->SetRelativeRotation(BodyVisualRotation);
 }
 
 int32 AModularCarPawn::AddWheel(FVector InRelativeLocation, bool bInDriven, bool bInSteering, float InRadius, float InWidth)
@@ -420,11 +507,9 @@ void AModularCarPawn::PostInitializeComponents()
 						CarAsync->EngineForceTotal = EngineForcePerWheel * WheelCount;
 						CarAsync->LateralGripRate = LateralGripRate;
 						CarAsync->LongitudinalGripRate = LongitudinalGripRate;
-						CarAsync->MaxYawAccelRad = FMath::DegreesToRadians(MaxYawAccel);
+						CarAsync->MaxYawRateRad = FMath::DegreesToRadians(MaxYawRate);
 						CarAsync->SteerRefSpeed = SteerRefSpeed;
 						CarAsync->RestSpeedDeadzone = RestSpeedDeadzone;
-						// Estimate yaw inertia of the chassis box to turn the desired yaw accel into a torque.
-						CarAsync->YawInertia = BodyMassKg * (BodyExtent.X * BodyExtent.X + BodyExtent.Y * BodyExtent.Y) / 12.0f;
 
 						if (NetworkPhysicsComponent)
 						{
@@ -516,6 +601,48 @@ void AModularCarPawn::RunSelfTest(float DeltaTime)
 		return;
 	}
 
+	// Mode 3: cosmetic-mesh check. Verify the car art loaded and replaced the cube/cylinder proxies,
+	// then quit. Catches the "still a cube" failure that the physics tests (1/2) cannot see.
+	if (Mode == 3)
+	{
+		if (!bSelfTestStarted)
+		{
+			bSelfTestStarted = true;
+			SelfTestTime = 0.0f;
+		}
+		SelfTestTime += DeltaTime;
+		if (SelfTestTime < 0.5f)
+		{
+			return;
+		}
+
+		// The cosmetic car (skeletal mesh) must be loaded & applied, the cube hidden, and every
+		// collision cylinder hidden (the car model covers them).
+		const USkeletalMesh* BV = BodyVisual ? BodyVisual->GetSkeletalMeshAsset() : nullptr;
+		const bool bBodyOk = (CarBodyMesh != nullptr) && (BV == CarBodyMesh) && Body && !Body->IsVisible();
+
+		int32 CylHidden = 0;
+		for (const FCarWheel& W : Wheels)
+		{
+			if (W.Mesh && !W.Mesh->IsVisible())
+			{
+				++CylHidden;
+			}
+		}
+		const bool bProxiesHidden = (Wheels.Num() > 0) && (CylHidden == Wheels.Num());
+		const bool bPass = bBodyOk && bProxiesHidden;
+
+		UE_LOG(LogTemp, Warning, TEXT("SELFTEST VISUAL | CarMesh=%s BodyArtApplied=%d hiddenCube=%d hiddenCylinders=%d/%d => %s"),
+			CarBodyMesh ? *CarBodyMesh->GetName() : TEXT("NULL"),
+			(CarBodyMesh != nullptr && BV == CarBodyMesh) ? 1 : 0,
+			(Body && !Body->IsVisible()) ? 1 : 0,
+			CylHidden, Wheels.Num(),
+			bPass ? TEXT("PASS") : TEXT("FAIL"));
+		UE_LOG(LogTemp, Warning, TEXT("SELFTEST DONE"));
+		FPlatformMisc::RequestExit(false);
+		return;
+	}
+
 	const bool bRestTest = (Mode == 2);
 
 	if (!bSelfTestStarted)
@@ -529,6 +656,7 @@ void AModularCarPawn::RunSelfTest(float DeltaTime)
 		RestPeakSpeed = 0.0f;
 		RestMinZ = BIG_NUMBER;
 		RestMaxZ = -BIG_NUMBER;
+		SelfTestPeakYawRate = 0.0f;
 		UE_LOG(LogTemp, Warning, TEXT("SELFTEST START | Mode=%d (%s) StartPos=%s Wheels=%d"),
 			Mode, bRestTest ? TEXT("REST") : TEXT("DRIVE"), *SelfTestStartPos.ToString(), Wheels.Num());
 	}
@@ -564,6 +692,12 @@ void AModularCarPawn::RunSelfTest(float DeltaTime)
 			RestMinZ = FMath::Min(RestMinZ, ZNow);
 			RestMaxZ = FMath::Max(RestMaxZ, ZNow);
 		}
+		else
+		{
+			// How fast the car yaws under full steer = the felt "steering angle".
+			const float YawRate = FMath::Abs(Body->GetPhysicsAngularVelocityInDegrees().Z);
+			SelfTestPeakYawRate = FMath::Max(SelfTestPeakYawRate, YawRate);
+		}
 	}
 
 	if (SelfTestLogAccum >= 0.5f)
@@ -594,8 +728,8 @@ void AModularCarPawn::RunSelfTest(float DeltaTime)
 		else
 		{
 			const float RideBand = SelfTestMaxZ - SelfTestMinZ;
-			UE_LOG(LogTemp, Warning, TEXT("SELFTEST RIDE | MinZ=%.0f MaxZ=%.0f Band=%.0f"),
-				SelfTestMinZ, SelfTestMaxZ, RideBand);
+			UE_LOG(LogTemp, Warning, TEXT("SELFTEST RIDE | MinZ=%.0f MaxZ=%.0f Band=%.0f PeakYawRate=%.1f deg/s (MaxYawRate=%.0f SteerRefSpeed=%.0f)"),
+				SelfTestMinZ, SelfTestMaxZ, RideBand, SelfTestPeakYawRate, MaxYawRate, SteerRefSpeed);
 		}
 
 		UE_LOG(LogTemp, Warning, TEXT("SELFTEST DONE"));

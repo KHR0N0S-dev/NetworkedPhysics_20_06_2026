@@ -9,6 +9,8 @@
 
 class UStaticMeshComponent;
 class UStaticMesh;
+class USkeletalMeshComponent;
+class USkeletalMesh;
 class UInputComponent;
 class UInputAction;
 class UInputMappingContext;
@@ -109,8 +111,7 @@ public:
 	float EngineForceTotal = 1000000.0f;
 	float LateralGripRate = 12.0f;
 	float LongitudinalGripRate = 4.0f;
-	float MaxYawAccelRad = 0.0f;   // rad/s^2 at full steer & full speed
-	float YawInertia = 1.0f;       // estimated yaw inertia, to turn the accel into a torque
+	float MaxYawRateRad = 0.0f;    // rad/s target yaw rate at full steer & full speed
 	float SteerRefSpeed = 350.0f;
 	float RestSpeedDeadzone = 3.0f;
 
@@ -129,6 +130,7 @@ struct FCarWheel
 {
 	GENERATED_BODY()
 
+	// Collision/support cylinder (hidden when cosmetic meshes are on).
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Wheel")
 	TObjectPtr<UStaticMeshComponent> Mesh = nullptr;
 
@@ -202,6 +204,11 @@ protected:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Modular Car")
 	TObjectPtr<UStaticMeshComponent> Body;
 
+	// Cosmetic car (skeletal SKM_SportsCar, body + wheels) overlaid on the hidden collision proxies.
+	// No collision, absolute scale, rendered in ref pose.
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Modular Car")
+	TObjectPtr<USkeletalMeshComponent> BodyVisual;
+
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Modular Car")
 	TObjectPtr<USpringArmComponent> SpringArm;
 
@@ -232,13 +239,14 @@ protected:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Modular Car|Drive")
 	float EngineForcePerWheel = 250000.0f;
 
-	// Steering = speed-scaled yaw acceleration (deg/s^2); the car only turns while rolling and
-	// reaches full authority at SteerRefSpeed (cm/s).
+	// Steering = target yaw rate (deg/s) at full steer, scaled by speed; the car only turns while
+	// rolling and reaches full turn rate at SteerRefSpeed (cm/s). This IS the "how sharp it turns"
+	// knob - raise MaxYawRate for a tighter turn. Lower SteerRefSpeed = full turn at lower speed.
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Modular Car|Drive")
-	float MaxYawAccel = 120.0f;
+	float MaxYawRate = 80.0f;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Modular Car|Drive")
-	float SteerRefSpeed = 350.0f;
+	float SteerRefSpeed = 250.0f;
 
 	// Grip = frame-rate-independent slip damping rate (1/s): force ~ -slipVel * mass * rate.
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Modular Car|Drive", meta = (ClampMin = "0.0"))
@@ -253,6 +261,23 @@ protected:
 	UPROPERTY(EditAnywhere, Category = "Modular Car|Debug")
 	bool bDebugDrive = true;
 
+	//-------------------- Cosmetic meshes --------------------
+	// Real car art (SportsCar_SM body + SportsCarWheel_SM wheels) is laid over the cube/cylinder
+	// collision proxies, which are hidden but still simulate. The tuned "box on wheels" physics is
+	// untouched. Tune these to line the art up with the proxies (offline asset sizes are unknown).
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Modular Car|Visuals")
+	bool bUseVisualMeshes = true;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Modular Car|Visuals")
+	FVector BodyVisualScale = FVector(1.0f, 1.0f, 1.0f);
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Modular Car|Visuals")
+	FVector BodyVisualOffset = FVector(0.0f, 0.0f, 0.0f);
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Modular Car|Visuals")
+	FRotator BodyVisualRotation = FRotator(0.0f, 0.0f, 0.0f);
+
 private:
 	void SettleOntoGround();
 	void PollKeyboard();
@@ -264,6 +289,7 @@ private:
 	void Input_Handbrake(const FInputActionValue& Value);
 
 	UStaticMeshComponent* CreateWheelMesh(const FVector& RelLoc, float Radius, float Width);
+	void ApplyBodyVisual();
 
 	// Networked physics
 	FModularCarAsync* CarAsync = nullptr;
@@ -285,6 +311,8 @@ private:
 	UPROPERTY()
 	TObjectPtr<UStaticMesh> CylinderMesh;
 	UPROPERTY()
+	TObjectPtr<USkeletalMesh> CarBodyMesh;
+	UPROPERTY()
 	TObjectPtr<UPhysicalMaterial> ChassisPhysMaterial;
 
 	// Local input, fed to the predicted sim each frame.
@@ -305,4 +333,5 @@ private:
 	float RestPeakSpeed = 0.0f;
 	float RestMinZ = 0.0f;
 	float RestMaxZ = 0.0f;
+	float SelfTestPeakYawRate = 0.0f; // deg/s, drive test: how hard the car actually turns
 };
