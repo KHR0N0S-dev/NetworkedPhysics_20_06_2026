@@ -336,6 +336,7 @@ private:
 	void ApplyBodyVisual();
 	void RefreshDriveTuningFromWheels();
 	void ApplyReplicatedWheelLayout();
+	void RefreshPhysicsBindings();
 	void InitializeDefaultSymmetricWheelSpecs();
 	FVector GetSymmetricPairWheelLocation(int32 PairIndex, bool bLeftSide) const;
 	bool AddSymmetricWheelPairAuthority();
@@ -402,6 +403,9 @@ private:
 	float RestPeakAngSpeed = 0.0f;    // deg/s, rest test: rotational jitter / wobble at rest
 	float RestMaxTilt = 0.0f;         // deg, rest test: max lean of the chassis off vertical
 	float SelfTestPeakYawRate = 0.0f; // deg/s, drive test: how hard the car actually turns
+	bool bSelfTestWheelPairAdded = false; // mode 8: add-wheel-then-drive sleep regression
+	FVector SelfTestDriveStartPos = FVector::ZeroVector;
+	bool bSelfTestDrivePhase = false;
 
 	// Collision self-test (mode 4): ram a second spawned car and check the physics stays sane.
 	UPROPERTY()

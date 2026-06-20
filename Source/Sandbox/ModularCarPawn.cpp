@@ -19,6 +19,7 @@
 #include "UObject/ConstructorHelpers.h"
 #include "PhysicalMaterials/PhysicalMaterial.h"
 #include "PhysicsEngine/PhysicsSettings.h"
+#include "Chaos/ChaosEngineInterface.h"
 
 #include "EnhancedInputComponent.h"
 #include "EnhancedInputSubsystems.h"
@@ -36,7 +37,7 @@
 static TAutoConsoleVariable<int32> CVarCarSelfTest(
 	TEXT("car.SelfTest"),
 	0,
-	TEXT("Headless self-test: 1=drive, 2=rest, 3=cosmetic-mesh, 4=collision, 5=adversarial collision, 6=networked collision (server+client), 7=dual-client head-on; logs telemetry then quits."),
+	TEXT("Headless self-test: 1=drive, 2=rest, 3=cosmetic-mesh, 4=collision, 5=adversarial collision, 6=networked collision (server+client), 7=dual-client head-on, 8=add-wheel sleep regression; logs telemetry then quits."),
 	ECVF_Default);
 
 //----------------------------------------------------
@@ -78,17 +79,22 @@ void FModularCarAsync::ApplyInput_Internal(const FNetInputModularCar& Input)
 void FModularCarAsync::BuildState_Internal(FNetStateModularCar& State) const {}
 void FModularCarAsync::ApplyState_Internal(const FNetStateModularCar& State) {}
 
+static void ApplyNeverSleepToParticle(Chaos::FConstPhysicsObjectHandle PhysicsObject)
+{
+	if (!PhysicsObject)
+	{
+		return;
+	}
+	Chaos::FWritePhysicsObjectInterface_Internal Interface = Chaos::FPhysicsObjectInternalInterface::GetWrite();
+	if (Chaos::FPBDRigidParticleHandle* ParticleHandle = Interface.GetRigidParticle(PhysicsObject))
+	{
+		ParticleHandle->SetSleepType(Chaos::ESleepType::NeverSleep);
+	}
+}
+
 void FModularCarAsync::OnPostInitialize_Internal()
 {
-	if (PhysicsObject)
-	{
-		Chaos::FWritePhysicsObjectInterface_Internal Interface = Chaos::FPhysicsObjectInternalInterface::GetWrite();
-		if (Chaos::FPBDRigidParticleHandle* ParticleHandle = Interface.GetRigidParticle(PhysicsObject))
-		{
-			// Never sleep: the prediction layer needs a live particle to resimulate.
-			ParticleHandle->SetSleepType(Chaos::ESleepType::NeverSleep);
-		}
-	}
+	ApplyNeverSleepToParticle(PhysicsObject);
 }
 
 void FModularCarAsync::ProcessInputs_Internal(int32 PhysicsStep)
@@ -125,6 +131,9 @@ void FModularCarAsync::OnPreSimulate_Internal()
 	{
 		return;
 	}
+
+	// Welded wheel rebuilds recreate the compound body; NeverSleep must be re-applied every step.
+	ParticleHandle->SetSleepType(Chaos::ESleepType::NeverSleep);
 
 	// Outside resimulation use the freshest local input (and keep *_Internal in sync for the
 	// standalone case, where the rewind machinery doesn't drive ProcessInputs_Internal). During a
@@ -247,6 +256,8 @@ AModularCarPawn::AModularCarPawn()
 	Body->SetCollisionResponseToAllChannels(ECR_Block);
 	Body->SetSimulatePhysics(true);
 	Body->SetEnableGravity(true);
+	Body->BodyInstance.SleepFamily = ESleepFamily::Sensitive;
+	Body->BodyInstance.bStartAwake = true;
 
 	SpringArm = CreateDefaultSubobject<USpringArmComponent>(TEXT("SpringArm"));
 	SpringArm->SetupAttachment(Body);
@@ -357,6 +368,7 @@ void AModularCarPawn::BeginPlay()
 		Body->SetVisibility(false);
 	}
 	ApplyBodyVisual();
+	RefreshPhysicsBindings();
 
 	RefreshDriveTuningFromWheels();
 
@@ -558,7 +570,24 @@ void AModularCarPawn::ApplyReplicatedWheelLayout()
 		Wheels.Add(Wheel);
 	}
 
+	RefreshPhysicsBindings();
 	RefreshDriveTuningFromWheels();
+}
+
+void AModularCarPawn::RefreshPhysicsBindings()
+{
+	if (!Body)
+	{
+		return;
+	}
+
+	if (CarAsync)
+	{
+		CarAsync->PhysicsObject = Body->GetPhysicsObjectByName(NAME_None);
+		ApplyNeverSleepToParticle(CarAsync->PhysicsObject);
+	}
+
+	Body->WakeAllRigidBodies();
 }
 
 void AModularCarPawn::OnRep_ReplicatedWheelSpecs()
@@ -759,6 +788,14 @@ void AModularCarPawn::Tick(float DeltaTime)
 	Super::Tick(DeltaTime);
 
 	UpdateAsyncDriveForcesFlag();
+
+	if (Body && Body->IsSimulatingPhysics() && IsLocallyControlled()
+		&& FMath::Abs(ThrottleInput_External) > 0.01f
+		&& Body->GetPhysicsLinearVelocity().SizeSquared() < FMath::Square(RestSpeedDeadzone))
+	{
+		Body->WakeAllRigidBodies();
+	}
+
 	PollKeyboard();
 	RunSelfTest(DeltaTime);
 
@@ -1172,6 +1209,78 @@ void AModularCarPawn::RunSelfTest(float DeltaTime)
 				&& (SepGain >= SepGainTol);
 			UE_LOG(LogTemp, Warning, TEXT("SELFTEST NETCOLLISION | HaveTarget=%d PeakSpeed=%.0f (<=%.0f) MinSep=%.0f (>=%.0f) TargetJitter=%.1f (<=%.0f) SepGainOnRetreat=%.0f (>=%.0f) => %s"),
 				bHaveTarget ? 1 : 0, CollPeakSpeed, SpeedTol, CollMinSep, SepTol, CollTargetJitter, JitterTol, SepGain, SepGainTol, bPass ? TEXT("PASS") : TEXT("FAIL"));
+			UE_LOG(LogTemp, Warning, TEXT("SELFTEST DONE"));
+			FPlatformMisc::RequestExit(false);
+		}
+		return;
+	}
+
+	// Mode 8: add symmetric wheel pair mid-session, settle, then drive — catches sleep-after-weld bug.
+	if (Mode == 8)
+	{
+		if (!bSelfTestStarted)
+		{
+			bSelfTestStarted = true;
+			SelfTestTime = 0.0f;
+			SelfTestLogAccum = 1.0f;
+			bSelfTestWheelPairAdded = false;
+			bSelfTestDrivePhase = false;
+			RestPeakSpeed = 0.0f;
+			SelfTestStartPos = Body->GetComponentLocation();
+			UE_LOG(LogTemp, Warning, TEXT("SELFTEST START | Mode=8 (ADDWHEEL-SLEEP) Wheels=%d"), Wheels.Num());
+		}
+
+		SelfTestTime += DeltaTime;
+		SelfTestLogAccum += DeltaTime;
+
+		if (SelfTestTime >= 2.0f && !bSelfTestWheelPairAdded && HasAuthority())
+		{
+			const int32 WheelsBefore = Wheels.Num();
+			bSelfTestWheelPairAdded = AddSymmetricWheelPairAuthority();
+			UE_LOG(LogTemp, Warning, TEXT("SELFTEST ADDWHEEL | ok=%d wheels %d -> %d"),
+				bSelfTestWheelPairAdded ? 1 : 0, WheelsBefore, Wheels.Num());
+		}
+
+		if (SelfTestTime >= 3.5f && bSelfTestWheelPairAdded)
+		{
+			if (!bSelfTestDrivePhase)
+			{
+				bSelfTestDrivePhase = true;
+				SelfTestDriveStartPos = Body->GetComponentLocation();
+			}
+			ThrottleInput_External = 1.0f;
+			SteerInput_External = 0.0f;
+			HandbrakeInput_External = 0.0f;
+			RestPeakSpeed = FMath::Max(RestPeakSpeed, (float)Body->GetComponentVelocity().Size());
+		}
+		else
+		{
+			ThrottleInput_External = 0.0f;
+			SteerInput_External = 0.0f;
+			HandbrakeInput_External = 0.0f;
+		}
+
+		if (SelfTestLogAccum >= 0.5f)
+		{
+			SelfTestLogAccum = 0.0f;
+			const FVector Pos = Body->GetComponentLocation();
+			UE_LOG(LogTemp, Warning, TEXT("SELFTEST t=%.1f | Wheels=%d Pos=(%.0f,%.0f,%.0f) Spd=%.0f"),
+				SelfTestTime, Wheels.Num(), Pos.X, Pos.Y, Pos.Z, Body->GetComponentVelocity().Size());
+		}
+
+		if (SelfTestTime >= 8.0f)
+		{
+			const FVector EndPos = Body->GetComponentLocation();
+			const float MovedXY = bSelfTestDrivePhase
+				? (float)FVector::Dist2D(EndPos, SelfTestDriveStartPos) : 0.0f;
+			const float SpeedTol = 40.0f;
+			const float MoveTol = 120.0f;
+			const bool bPass = bSelfTestWheelPairAdded && bSelfTestDrivePhase
+				&& (Wheels.Num() == 6)
+				&& (RestPeakSpeed >= SpeedTol)
+				&& (MovedXY >= MoveTol);
+			UE_LOG(LogTemp, Warning, TEXT("SELFTEST ADDWHEEL | Wheels=%d PeakSpeed=%.0f (>=%.0f) MovedXY=%.0f (>=%.0f) => %s"),
+				Wheels.Num(), RestPeakSpeed, SpeedTol, MovedXY, MoveTol, bPass ? TEXT("PASS") : TEXT("FAIL"));
 			UE_LOG(LogTemp, Warning, TEXT("SELFTEST DONE"));
 			FPlatformMisc::RequestExit(false);
 		}
