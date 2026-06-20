@@ -12,6 +12,7 @@
 #include "Engine/StaticMesh.h"
 #include "Engine/World.h"
 #include "Engine/Engine.h"
+#include "EngineUtils.h"
 #include "HAL/PlatformMisc.h"
 #include "GameFramework/PlayerController.h"
 #include "InputCoreTypes.h"
@@ -30,11 +31,12 @@
 #include "PBDRigidsSolver.h"
 #include "Chaos/PhysicsObjectInterface.h"
 #include "Chaos/PhysicsObjectInternalInterface.h"
+#include "Net/UnrealNetwork.h"
 
 static TAutoConsoleVariable<int32> CVarCarSelfTest(
 	TEXT("car.SelfTest"),
 	0,
-	TEXT("Headless self-test: 1 = drive in a circle, 2 = rest-stability check, 3 = cosmetic-mesh check; logs telemetry then quits."),
+	TEXT("Headless self-test: 1=drive, 2=rest, 3=cosmetic-mesh, 4=collision, 5=adversarial collision, 6=networked collision (server+client), 7=dual-client head-on; logs telemetry then quits."),
 	ECVF_Default);
 
 //----------------------------------------------------
@@ -139,6 +141,13 @@ void FModularCarAsync::OnPreSimulate_Internal()
 		}
 	}
 
+	// Client sim-proxies must not apply grip/drive locally — the server's physics is authoritative and
+	// local grip forces fight predicted-body contacts (the multiplayer "sticking" bug).
+	if (!bApplyDriveForces)
+	{
+		return;
+	}
+
 	const float Throttle = FMath::Clamp(Throttle_Internal, -1.0f, 1.0f);
 	const float Steer = FMath::Clamp(Steer_Internal, -1.0f, 1.0f);
 	const bool bHandbrake = Handbrake_Internal > 0.5f;
@@ -163,14 +172,24 @@ void FModularCarAsync::OnPreSimulate_Internal()
 		Force += Fwd * (Throttle * EngineForceTotal);
 	}
 
+	// Grip forces are friction-circle LIMITED (capped at MaxGripAccel * mass). Without a cap the
+	// "-vel * mass * rate" term is an infinite anchor: when another car rams this one, the grip
+	// resists the push with unbounded force, so the car won't budge ("sticks") and the contact
+	// solver blows up. Capping makes grip behave like a real tyre - a hard enough shove overcomes it
+	// and the car slides instead of breaking the physics.
+	const Chaos::FReal MaxGripForce = MaxGripAccel * Mass;
+
 	if (FMath::Abs(RightVel) > RestSpeedDeadzone)
 	{
-		Force += -Right * (RightVel * Mass * LateralGripRate);
+		const Chaos::FReal Lat = FMath::Clamp(RightVel * Mass * LateralGripRate, -MaxGripForce, MaxGripForce);
+		Force += -Right * Lat;
 	}
 
-	if ((bHandbrake || FMath::Abs(Throttle) < 0.05f) && FMath::Abs(FwdVel) > RestSpeedDeadzone)
+	// Longitudinal grip only under handbrake — coasting with throttle=0 must stay pushable in collisions.
+	if (bHandbrake && FMath::Abs(FwdVel) > RestSpeedDeadzone)
 	{
-		Force += -Fwd * (FwdVel * Mass * LongitudinalGripRate);
+		const Chaos::FReal Lon = FMath::Clamp(FwdVel * Mass * LongitudinalGripRate, -MaxGripForce, MaxGripForce);
+		Force += -Fwd * Lon;
 	}
 
 	if (Force.SizeSquared() > UE_SMALL_NUMBER)
@@ -202,6 +221,7 @@ AModularCarPawn::AModularCarPawn()
 {
 	PrimaryActorTick.bCanEverTick = true;
 	bReplicates = true;
+	SetReplicateMovement(false);
 	// Movement/state sync is handled by the network physics component (prediction + reconciliation),
 	// not by ordinary movement replication. The game mode possesses each player's pawn.
 	SpawnCollisionHandlingMethod = ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButAlwaysSpawn;
@@ -255,6 +275,12 @@ AModularCarPawn::AModularCarPawn()
 	BodyVisual->SetGenerateOverlapEvents(false);
 	BodyVisual->SetAnimationMode(EAnimationMode::AnimationSingleNode);
 	BodyVisual->PrimaryComponentTick.bCanEverTick = false;
+	// Purely cosmetic: no simulation, no gravity. The physics asset is cleared in ApplyBodyVisual
+	// (after the mesh is set) so the skeletal mesh creates NO kinematic physics bodies - those bodies,
+	// updated at game-frame rate while the chassis steps on the async physics thread, lag the chassis
+	// and show up as the car visibly jittering.
+	BodyVisual->SetSimulatePhysics(false);
+	BodyVisual->SetEnableGravity(false);
 
 	// Networked physics component (only when physics prediction is enabled in project settings).
 	if (UPhysicsSettings::Get()->PhysicsPrediction.bEnablePhysicsPrediction)
@@ -269,6 +295,9 @@ AModularCarPawn::AModularCarPawn()
 		// body each update instead of being reconciled by prediction - that snapping is the network
 		// jitter. Resimulation rewinds & replays from the corrected state, so motion stays smooth.
 		SetPhysicsReplicationMode(EPhysicsReplicationMode::Resimulation);
+
+		static const FName NetworkPhysicsSettingsComponentName(TEXT("NetworkPhysicsSettingsComponent"));
+		NetworkPhysicsSettingsComponent = CreateDefaultSubobject<UNetworkPhysicsSettingsComponent>(NetworkPhysicsSettingsComponentName);
 	}
 }
 
@@ -311,16 +340,13 @@ void AModularCarPawn::BeginPlay()
 
 	Body->WakeAllRigidBodies();
 
-	if (bSpawnDefaultWheels)
+	if (HasAuthority() && bSpawnDefaultWheels && ReplicatedWheelSpecs.Num() == 0)
 	{
-		const float HX = BodyExtent.X * 0.5f - 70.0f;
-		const float HY = BodyExtent.Y * 0.5f + 15.0f;
-		const float ZZ = -BodyExtent.Z * 0.5f - 10.0f;
-
-		AddWheel(FVector( HX, -HY, ZZ), true, true);
-		AddWheel(FVector( HX,  HY, ZZ), true, true);
-		AddWheel(FVector(-HX, -HY, ZZ), true, false);
-		AddWheel(FVector(-HX,  HY, ZZ), true, false);
+		InitializeDefaultSymmetricWheelSpecs();
+	}
+	if (ReplicatedWheelSpecs.Num() > 0)
+	{
+		ApplyReplicatedWheelLayout();
 	}
 
 	SettleOntoGround();
@@ -332,9 +358,12 @@ void AModularCarPawn::BeginPlay()
 	}
 	ApplyBodyVisual();
 
-	UE_LOG(LogTemp, Warning, TEXT("CARSETUP | Sim=%d Grav=%d Mass=%.0f Wheels=%d Net=%d"),
+	RefreshDriveTuningFromWheels();
+
+	UE_LOG(LogTemp, Warning, TEXT("CARSETUP | Sim=%d Grav=%d Mass=%.0f Wheels=%d Net=%d EngineForce=%.0f"),
 		Body->IsSimulatingPhysics() ? 1 : 0, Body->IsGravityEnabled() ? 1 : 0,
-		Body->GetMass(), Wheels.Num(), NetworkPhysicsComponent ? 1 : 0);
+		Body->GetMass(), Wheels.Num(), NetworkPhysicsComponent ? 1 : 0,
+		CarAsync ? CarAsync->EngineForceTotal : 0.0f);
 
 	// Diagnostics: did the cosmetic car load and get applied, and are the proxies hidden?
 	const USkeletalMesh* BV = BodyVisual ? BodyVisual->GetSkeletalMeshAsset() : nullptr;
@@ -435,6 +464,11 @@ void AModularCarPawn::ApplyBodyVisual()
 		return;
 	}
 	BodyVisual->SetSkeletalMeshAsset(CarBodyMesh);
+	// Drop the mesh's physics asset so no kinematic bodies are created (cosmetic follower only).
+	// Setting the mesh can re-instantiate the asset's physics state, so clear it here, afterwards.
+	BodyVisual->SetSimulatePhysics(false);
+	BodyVisual->SetPhysicsAsset(nullptr);
+	BodyVisual->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 	BodyVisual->SetUsingAbsoluteScale(true);
 	BodyVisual->SetWorldScale3D(BodyVisualScale);
 
@@ -448,35 +482,195 @@ void AModularCarPawn::ApplyBodyVisual()
 	BodyVisual->SetRelativeRotation(BodyVisualRotation);
 }
 
-int32 AModularCarPawn::AddWheel(FVector InRelativeLocation, bool bInDriven, bool bInSteering, float InRadius, float InWidth)
+FVector AModularCarPawn::GetSymmetricPairWheelLocation(int32 PairIndex, bool bLeftSide) const
+{
+	const float HX = BodyExtent.X * 0.5f - 70.0f;
+	const float HY = BodyExtent.Y * 0.5f + 15.0f;
+	const float ZZ = -BodyExtent.Z * 0.5f - 10.0f;
+
+	float X = HX;
+	if (PairIndex == 1)
+	{
+		X = -HX;
+	}
+	else if (PairIndex > 1)
+	{
+		X = -HX - static_cast<float>(PairIndex - 1) * 140.0f;
+	}
+
+	const float Y = bLeftSide ? -HY : HY;
+	return FVector(X, Y, ZZ);
+}
+
+void AModularCarPawn::AppendSymmetricPairSpecs(int32 PairIndex)
+{
+	const bool bFrontAxle = (PairIndex == 0);
+	const float DefaultRadius = 35.0f;
+	const float DefaultWidth = 20.0f;
+
+	FModularCarWheelSpec Left;
+	Left.RelativeLocation = GetSymmetricPairWheelLocation(PairIndex, true);
+	Left.bDriven = true;
+	Left.bSteering = bFrontAxle;
+	Left.Radius = DefaultRadius;
+	Left.Width = DefaultWidth;
+
+	FModularCarWheelSpec Right = Left;
+	Right.RelativeLocation = GetSymmetricPairWheelLocation(PairIndex, false);
+	Right.bSteering = bFrontAxle;
+
+	ReplicatedWheelSpecs.Add(Left);
+	ReplicatedWheelSpecs.Add(Right);
+}
+
+void AModularCarPawn::InitializeDefaultSymmetricWheelSpecs()
+{
+	ReplicatedWheelSpecs.Reset();
+	AppendSymmetricPairSpecs(0);
+	AppendSymmetricPairSpecs(1);
+}
+
+void AModularCarPawn::ApplyReplicatedWheelLayout()
 {
 	if (!Body || !CylinderMesh)
+	{
+		return;
+	}
+
+	for (FCarWheel& Wheel : Wheels)
+	{
+		if (Wheel.Mesh)
+		{
+			Wheel.Mesh->DestroyComponent();
+		}
+	}
+	Wheels.Reset();
+
+	for (const FModularCarWheelSpec& Spec : ReplicatedWheelSpecs)
+	{
+		FCarWheel Wheel;
+		Wheel.RelativeLocation = Spec.RelativeLocation;
+		Wheel.bDriven = Spec.bDriven;
+		Wheel.bSteering = Spec.bSteering;
+		Wheel.Radius = Spec.Radius;
+		Wheel.Width = Spec.Width;
+		Wheel.Mesh = CreateWheelMesh(Spec.RelativeLocation, Spec.Radius, Spec.Width);
+		Wheels.Add(Wheel);
+	}
+
+	RefreshDriveTuningFromWheels();
+}
+
+void AModularCarPawn::OnRep_ReplicatedWheelSpecs()
+{
+	ApplyReplicatedWheelLayout();
+}
+
+bool AModularCarPawn::AddSymmetricWheelPairAuthority()
+{
+	if (!HasAuthority())
+	{
+		return false;
+	}
+
+	const int32 PairCount = ReplicatedWheelSpecs.Num() / 2;
+	if (PairCount >= MaxSymmetricWheelPairs)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("AddSymmetricWheelPair: max pairs %d reached"), MaxSymmetricWheelPairs);
+		return false;
+	}
+
+	AppendSymmetricPairSpecs(PairCount);
+	ApplyReplicatedWheelLayout();
+	UE_LOG(LogTemp, Warning, TEXT("AddSymmetricWheelPair | Pairs=%d Wheels=%d"), PairCount + 1, Wheels.Num());
+	return true;
+}
+
+bool AModularCarPawn::RemoveSymmetricWheelPairAuthority()
+{
+	if (!HasAuthority())
+	{
+		return false;
+	}
+
+	if (ReplicatedWheelSpecs.Num() < 2)
+	{
+		return false;
+	}
+
+	ReplicatedWheelSpecs.RemoveAt(ReplicatedWheelSpecs.Num() - 1);
+	ReplicatedWheelSpecs.RemoveAt(ReplicatedWheelSpecs.Num() - 1);
+	ApplyReplicatedWheelLayout();
+	UE_LOG(LogTemp, Warning, TEXT("RemoveSymmetricWheelPair | Pairs=%d Wheels=%d"), ReplicatedWheelSpecs.Num() / 2, Wheels.Num());
+	return true;
+}
+
+void AModularCarPawn::ServerRequestAddSymmetricWheelPair_Implementation()
+{
+	AddSymmetricWheelPairAuthority();
+}
+
+void AModularCarPawn::ServerRequestRemoveSymmetricWheelPair_Implementation()
+{
+	RemoveSymmetricWheelPairAuthority();
+}
+
+void AModularCarPawn::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
+{
+	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
+	DOREPLIFETIME(AModularCarPawn, ReplicatedWheelSpecs);
+}
+
+void AModularCarPawn::RefreshDriveTuningFromWheels()
+{
+	int32 DrivenCount = 0;
+	for (const FCarWheel& W : Wheels)
+	{
+		if (W.bDriven)
+		{
+			++DrivenCount;
+		}
+	}
+	const int32 EffectiveWheels = FMath::Max(1, DrivenCount > 0 ? DrivenCount : Wheels.Num());
+	if (CarAsync)
+	{
+		CarAsync->EngineForceTotal = EngineForcePerWheel * EffectiveWheels;
+	}
+
+	RestRideHeight = BodyExtent.Z * 0.5f;
+	for (const FCarWheel& W : Wheels)
+	{
+		RestRideHeight = FMath::Max(RestRideHeight, -(W.RelativeLocation.Z - W.Radius));
+	}
+}
+
+int32 AModularCarPawn::AddWheel(FVector InRelativeLocation, bool bInDriven, bool bInSteering, float InRadius, float InWidth)
+{
+	if (!HasAuthority())
 	{
 		return INDEX_NONE;
 	}
 
-	FCarWheel Wheel;
-	Wheel.RelativeLocation = InRelativeLocation;
-	Wheel.bDriven = bInDriven;
-	Wheel.bSteering = bInSteering;
-	Wheel.Radius = InRadius;
-	Wheel.Width = InWidth;
-	Wheel.Mesh = CreateWheelMesh(InRelativeLocation, InRadius, InWidth);
-
-	return Wheels.Add(Wheel);
+	FModularCarWheelSpec Spec;
+	Spec.RelativeLocation = InRelativeLocation;
+	Spec.bDriven = bInDriven;
+	Spec.bSteering = bInSteering;
+	Spec.Radius = InRadius;
+	Spec.Width = InWidth;
+	ReplicatedWheelSpecs.Add(Spec);
+	ApplyReplicatedWheelLayout();
+	return Wheels.Num() - 1;
 }
 
 bool AModularCarPawn::RemoveWheel(int32 WheelIndex)
 {
-	if (!Wheels.IsValidIndex(WheelIndex))
+	if (!HasAuthority() || !ReplicatedWheelSpecs.IsValidIndex(WheelIndex))
 	{
 		return false;
 	}
-	if (UStaticMeshComponent* Comp = Wheels[WheelIndex].Mesh)
-	{
-		Comp->DestroyComponent();
-	}
-	Wheels.RemoveAt(WheelIndex);
+
+	ReplicatedWheelSpecs.RemoveAt(WheelIndex);
+	ApplyReplicatedWheelLayout();
 	return true;
 }
 
@@ -503,13 +697,13 @@ void AModularCarPawn::PostInitializeComponents()
 						CarAsync->PhysicsObject = Root->GetPhysicsObjectByName(NAME_None);
 
 						// Copy tuning into the async object (constant + identical server/client).
-						const int32 WheelCount = FMath::Max(1, bSpawnDefaultWheels ? 4 : Wheels.Num());
-						CarAsync->EngineForceTotal = EngineForcePerWheel * WheelCount;
 						CarAsync->LateralGripRate = LateralGripRate;
 						CarAsync->LongitudinalGripRate = LongitudinalGripRate;
+						CarAsync->MaxGripAccel = MaxGripAccel;
 						CarAsync->MaxYawRateRad = FMath::DegreesToRadians(MaxYawRate);
 						CarAsync->SteerRefSpeed = SteerRefSpeed;
 						CarAsync->RestSpeedDeadzone = RestSpeedDeadzone;
+						CarAsync->bApplyDriveForces = ShouldApplyDriveForces();
 
 						if (NetworkPhysicsComponent)
 						{
@@ -541,10 +735,30 @@ void AModularCarPawn::EndPlay(const EEndPlayReason::Type EndPlayReason)
 	Super::EndPlay(EndPlayReason);
 }
 
+bool AModularCarPawn::ShouldApplyDriveForces() const
+{
+	const ENetRole LocalRole = GetLocalRole();
+	if (LocalRole == ROLE_Authority || LocalRole == ROLE_AutonomousProxy)
+	{
+		return true;
+	}
+	// Simulated proxy on a client: remote car — physics replication drives the body, no local grip.
+	return false;
+}
+
+void AModularCarPawn::UpdateAsyncDriveForcesFlag()
+{
+	if (CarAsync)
+	{
+		CarAsync->bApplyDriveForces = ShouldApplyDriveForces();
+	}
+}
+
 void AModularCarPawn::Tick(float DeltaTime)
 {
 	Super::Tick(DeltaTime);
 
+	UpdateAsyncDriveForcesFlag();
 	PollKeyboard();
 	RunSelfTest(DeltaTime);
 
@@ -591,6 +805,19 @@ void AModularCarPawn::PollKeyboard()
 	SetThrottleInput(Throttle);
 	SetSteerInput(Steer);
 	SetHandbrake(PC->IsInputKeyDown(EKeys::SpaceBar));
+
+	// Symmetric wheel pairs (replicated): P = add axle (L+R), L = remove last axle.
+	if (IsLocallyControlled())
+	{
+		if (PC->WasInputKeyJustPressed(EKeys::P))
+		{
+			ServerRequestAddSymmetricWheelPair();
+		}
+		if (PC->WasInputKeyJustPressed(EKeys::L))
+		{
+			ServerRequestRemoveSymmetricWheelPair();
+		}
+	}
 }
 
 void AModularCarPawn::RunSelfTest(float DeltaTime)
@@ -616,30 +843,467 @@ void AModularCarPawn::RunSelfTest(float DeltaTime)
 			return;
 		}
 
-		// The cosmetic car (skeletal mesh) must be loaded & applied, the cube hidden, and every
-		// collision cylinder hidden (the car model covers them).
 		const USkeletalMesh* BV = BodyVisual ? BodyVisual->GetSkeletalMeshAsset() : nullptr;
-		const bool bBodyOk = (CarBodyMesh != nullptr) && (BV == CarBodyMesh) && Body && !Body->IsVisible();
-
-		int32 CylHidden = 0;
+		const bool bCubeVisible = (Body && Body->IsVisible());
+		int32 CylVisible = 0;
 		for (const FCarWheel& W : Wheels)
 		{
-			if (W.Mesh && !W.Mesh->IsVisible())
+			if (W.Mesh && W.Mesh->IsVisible())
 			{
-				++CylHidden;
+				++CylVisible;
 			}
 		}
-		const bool bProxiesHidden = (Wheels.Num() > 0) && (CylHidden == Wheels.Num());
-		const bool bPass = bBodyOk && bProxiesHidden;
 
-		UE_LOG(LogTemp, Warning, TEXT("SELFTEST VISUAL | CarMesh=%s BodyArtApplied=%d hiddenCube=%d hiddenCylinders=%d/%d => %s"),
+		bool bPass;
+		if (bUseVisualMeshes)
+		{
+			// Cosmetic mode: skeletal car applied, cube + all cylinders hidden.
+			bPass = (CarBodyMesh != nullptr) && (BV == CarBodyMesh) && !bCubeVisible
+				&& (Wheels.Num() > 0) && (CylVisible == 0);
+		}
+		else
+		{
+			// Rolled-back cube mode: plain cube + cylinders visible, no skeletal car.
+			bPass = bCubeVisible && (Wheels.Num() > 0) && (CylVisible == Wheels.Num()) && (BV == nullptr);
+		}
+
+		UE_LOG(LogTemp, Warning, TEXT("SELFTEST VISUAL | UseVis=%d CarMesh=%s cubeVisible=%d cylindersVisible=%d/%d => %s"),
+			bUseVisualMeshes ? 1 : 0,
 			CarBodyMesh ? *CarBodyMesh->GetName() : TEXT("NULL"),
-			(CarBodyMesh != nullptr && BV == CarBodyMesh) ? 1 : 0,
-			(Body && !Body->IsVisible()) ? 1 : 0,
-			CylHidden, Wheels.Num(),
+			bCubeVisible ? 1 : 0,
+			CylVisible, Wheels.Num(),
 			bPass ? TEXT("PASS") : TEXT("FAIL"));
 		UE_LOG(LogTemp, Warning, TEXT("SELFTEST DONE"));
 		FPlatformMisc::RequestExit(false);
+		return;
+	}
+
+	// Mode 4: collision test. Spawn a second (passive) car ahead, ram it at full throttle, and verify
+	// the physics stays sane - no explosion (huge speed), no launch into the air, no tunnelling
+	// through each other, and the target actually gets shoved (not stuck/immovable).
+	if (Mode == 4)
+	{
+		if (!IsLocallyControlled())
+		{
+			return; // only the driven (player) car orchestrates; the spawned target stays passive
+		}
+
+		if (!bSelfTestStarted)
+		{
+			bSelfTestStarted = true;
+			SelfTestTime = 0.0f;
+			SelfTestLogAccum = 1.0f;
+			CollPeakSpeed = 0.0f;
+			CollMaxZ = -BIG_NUMBER;
+			CollMinSep = BIG_NUMBER;
+			SelfTestStartPos = Body->GetComponentLocation();
+
+			if (UWorld* World = GetWorld())
+			{
+				FActorSpawnParameters Params;
+				Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+				CollTargetStart = GetActorLocation() + GetActorForwardVector() * 700.0f;
+				CollTarget = World->SpawnActor<AModularCarPawn>(GetClass(), CollTargetStart, GetActorRotation(), Params);
+			}
+			UE_LOG(LogTemp, Warning, TEXT("SELFTEST START | Mode=4 (COLLISION) target=%s"),
+				CollTarget ? *CollTarget->GetName() : TEXT("NULL"));
+		}
+
+		SelfTestTime += DeltaTime;
+		SelfTestLogAccum += DeltaTime;
+
+		const bool bSettled = SelfTestTime > 1.5f;
+		ThrottleInput_External = bSettled ? 1.0f : 0.0f; // ram forward after both cars settle
+		SteerInput_External = 0.0f;
+		HandbrakeInput_External = 0.0f;
+
+		if (bSettled && CollTarget)
+		{
+			const FVector A = Body->GetComponentLocation();
+			const FVector B = CollTarget->GetActorLocation();
+			CollPeakSpeed = FMath::Max3(CollPeakSpeed, (float)Body->GetComponentVelocity().Size(), (float)CollTarget->GetVelocity().Size());
+			CollMaxZ = FMath::Max3(CollMaxZ, (float)A.Z, (float)B.Z);
+			CollMinSep = FMath::Min(CollMinSep, (float)FVector::Dist(A, B));
+		}
+
+		if (SelfTestLogAccum >= 0.5f)
+		{
+			SelfTestLogAccum = 0.0f;
+			const FVector A = Body->GetComponentLocation();
+			const FVector B = CollTarget ? CollTarget->GetActorLocation() : FVector::ZeroVector;
+			UE_LOG(LogTemp, Warning, TEXT("SELFTEST t=%.1f | Self=(%.0f,%.0f,%.0f) Target=(%.0f,%.0f,%.0f) Sep=%.0f"),
+				SelfTestTime, A.X, A.Y, A.Z, B.X, B.Y, B.Z, (float)FVector::Dist(A, B));
+		}
+
+		if (SelfTestTime >= 7.0f)
+		{
+			const FVector EndB = CollTarget ? CollTarget->GetActorLocation() : FVector::ZeroVector;
+			const float TargetPushed = CollTarget ? (float)FVector::Dist(FVector(EndB.X, EndB.Y, 0), FVector(CollTargetStart.X, CollTargetStart.Y, 0)) : 0.0f;
+			const bool bHasTarget = (CollTarget != nullptr);
+			const bool bFinite = FMath::IsFinite(CollPeakSpeed) && FMath::IsFinite(CollMaxZ) && FMath::IsFinite(CollMinSep);
+			const float SpeedTol = 2500.0f;          // explosion if either car flies off this fast
+			const float ZTol = SelfTestStartPos.Z + 300.0f; // launched into the air
+			const float SepTol = 150.0f;             // tunnelled through each other if closer than this
+			const float PushTol = 50.0f;             // target must actually be shoved (not stuck)
+			const bool bPass = bHasTarget && bFinite
+				&& (CollPeakSpeed <= SpeedTol)
+				&& (CollMaxZ <= ZTol)
+				&& (CollMinSep >= SepTol)
+				&& (TargetPushed >= PushTol);
+			UE_LOG(LogTemp, Warning, TEXT("SELFTEST COLLISION | PeakSpeed=%.0f (<=%.0f) MaxZ=%.0f (<=%.0f) MinSep=%.0f (>=%.0f) TargetPushed=%.0f (>=%.0f) => %s"),
+				CollPeakSpeed, SpeedTol, CollMaxZ, ZTol, CollMinSep, SepTol, TargetPushed, PushTol, bPass ? TEXT("PASS") : TEXT("FAIL"));
+			UE_LOG(LogTemp, Warning, TEXT("SELFTEST DONE"));
+			FPlatformMisc::RequestExit(false);
+		}
+		return;
+	}
+
+	// Mode 5: adversarial collision. Target spawned ahead AND offset sideways (corner/side contact),
+	// rammed at full throttle, then the rammer REVERSES away. Catches lateral sticking and "clinging"
+	// (the rammed car following when you back off) that the clean rear-end test (mode 4) misses.
+	if (Mode == 5)
+	{
+		if (!IsLocallyControlled())
+		{
+			return;
+		}
+
+		if (!bSelfTestStarted)
+		{
+			bSelfTestStarted = true;
+			SelfTestTime = 0.0f;
+			SelfTestLogAccum = 1.0f;
+			CollPeakSpeed = 0.0f;
+			CollMaxZ = -BIG_NUMBER;
+			CollMinSep = BIG_NUMBER;
+			CollSepRamEnd = -1.0f;
+			SelfTestStartPos = Body->GetComponentLocation();
+
+			if (UWorld* World = GetWorld())
+			{
+				FActorSpawnParameters Params;
+				Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+				// 550 ahead + 180 to the side so the rammer hits a front corner, not dead-centre.
+				CollTargetStart = GetActorLocation() + GetActorForwardVector() * 550.0f + GetActorRightVector() * 180.0f;
+				CollTarget = World->SpawnActor<AModularCarPawn>(GetClass(), CollTargetStart, GetActorRotation(), Params);
+			}
+			UE_LOG(LogTemp, Warning, TEXT("SELFTEST START | Mode=5 (COLLISION-ADV) target=%s"),
+				CollTarget ? *CollTarget->GetName() : TEXT("NULL"));
+		}
+
+		SelfTestTime += DeltaTime;
+		SelfTestLogAccum += DeltaTime;
+
+		// Phases: settle (0-1.5s), ram forward (1.5-4.5s), reverse away (4.5-7.5s).
+		const bool bRam = (SelfTestTime > 1.5f && SelfTestTime <= 4.5f);
+		const bool bRetreat = (SelfTestTime > 4.5f);
+		ThrottleInput_External = bRetreat ? -1.0f : (bRam ? 1.0f : 0.0f);
+		SteerInput_External = 0.0f;
+		HandbrakeInput_External = 0.0f;
+
+		if (CollTarget && (bRam || bRetreat))
+		{
+			const FVector A = Body->GetComponentLocation();
+			const FVector B = CollTarget->GetActorLocation();
+			CollPeakSpeed = FMath::Max3(CollPeakSpeed, (float)Body->GetComponentVelocity().Size(), (float)CollTarget->GetVelocity().Size());
+			CollMaxZ = FMath::Max3(CollMaxZ, (float)A.Z, (float)B.Z);
+			CollMinSep = FMath::Min(CollMinSep, (float)FVector::Dist(A, B));
+		}
+		// Capture separation right when the ram ends / retreat begins.
+		if (CollSepRamEnd < 0.0f && SelfTestTime > 4.5f && CollTarget)
+		{
+			CollSepRamEnd = (float)FVector::Dist(Body->GetComponentLocation(), CollTarget->GetActorLocation());
+		}
+
+		if (SelfTestLogAccum >= 0.5f)
+		{
+			SelfTestLogAccum = 0.0f;
+			const FVector A = Body->GetComponentLocation();
+			const FVector B = CollTarget ? CollTarget->GetActorLocation() : FVector::ZeroVector;
+			UE_LOG(LogTemp, Warning, TEXT("SELFTEST t=%.1f (%s) | Self=(%.0f,%.0f,%.0f) Target=(%.0f,%.0f,%.0f) Sep=%.0f"),
+				SelfTestTime, bRetreat ? TEXT("retreat") : (bRam ? TEXT("ram") : TEXT("settle")),
+				A.X, A.Y, A.Z, B.X, B.Y, B.Z, (float)FVector::Dist(A, B));
+		}
+
+		if (SelfTestTime >= 7.5f)
+		{
+			const float EndSep = CollTarget ? (float)FVector::Dist(Body->GetComponentLocation(), CollTarget->GetActorLocation()) : 0.0f;
+			// Clinging: after retreating, the gap must GROW vs when the ram ended (target not dragged).
+			const float SepGain = (CollSepRamEnd > 0.0f) ? (EndSep - CollSepRamEnd) : 0.0f;
+			const bool bHasTarget = (CollTarget != nullptr);
+			const bool bFinite = FMath::IsFinite(CollPeakSpeed) && FMath::IsFinite(CollMaxZ) && FMath::IsFinite(EndSep);
+			const float SpeedTol = 2500.0f;
+			const float ZTol = SelfTestStartPos.Z + 300.0f;
+			const float SepTol = 150.0f;
+			const float SepGainTol = 100.0f; // must pull apart by at least this on retreat (no clinging)
+			const bool bPass = bHasTarget && bFinite
+				&& (CollPeakSpeed <= SpeedTol)
+				&& (CollMaxZ <= ZTol)
+				&& (CollMinSep >= SepTol)
+				&& (SepGain >= SepGainTol);
+			UE_LOG(LogTemp, Warning, TEXT("SELFTEST COLLISION-ADV | PeakSpeed=%.0f (<=%.0f) MaxZ=%.0f (<=%.0f) MinSep=%.0f (>=%.0f) SepGainOnRetreat=%.0f (>=%.0f) => %s"),
+				CollPeakSpeed, SpeedTol, CollMaxZ, ZTol, CollMinSep, SepTol, SepGain, SepGainTol, bPass ? TEXT("PASS") : TEXT("FAIL"));
+			UE_LOG(LogTemp, Warning, TEXT("SELFTEST DONE"));
+			FPlatformMisc::RequestExit(false);
+		}
+		return;
+	}
+
+	// Mode 6: NETWORKED collision test. Run across a dedicated server + client. The server spawns a
+	// stationary target car ahead of the (client-controlled) player car; on the client that target is
+	// a sim-proxy. The client rams it then retreats - this is the predicted-body-vs-sim-proxy contact
+	// that sticks in multiplayer, which standalone modes 4/5 cannot exercise.
+	if (Mode == 6)
+	{
+		const UWorld* World = GetWorld();
+		const bool bNetworked = World && (World->GetNetMode() != NM_Standalone);
+
+		// --- Server side: spawn one stationary target ahead of the real player's car. ---
+		if (HasAuthority())
+		{
+			if (bIsNetTarget || GetController() == nullptr)
+			{
+				return; // only the real player's (controller-owned) pawn spawns; targets stay passive
+			}
+			NetTime += DeltaTime;
+			if (!bNetServerSpawned && NetTime > 1.5f) // let the player car settle first
+			{
+				bNetServerSpawned = true;
+				if (UWorld* W = GetWorld())
+				{
+					FActorSpawnParameters Params;
+					Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+					const FVector Ahead = GetActorLocation() + GetActorForwardVector() * 700.0f;
+					if (AModularCarPawn* T = W->SpawnActor<AModularCarPawn>(GetClass(), Ahead, GetActorRotation(), Params))
+					{
+						T->bIsNetTarget = true;
+						UE_LOG(LogTemp, Warning, TEXT("SELFTEST NET | SERVER spawned target %s at %s"), *T->GetName(), *Ahead.ToString());
+					}
+				}
+			}
+			return; // server never drives; the client's replicated input moves the player car
+		}
+
+		// --- Client side: only the locally controlled player car drives & measures. ---
+		if (!IsLocallyControlled())
+		{
+			return;
+		}
+
+		// Find the sim-proxy target (the other modular car).
+		if (!CollTarget)
+		{
+			for (TActorIterator<AModularCarPawn> It(GetWorld()); It; ++It)
+			{
+				if (*It != this) { CollTarget = *It; break; }
+			}
+		}
+
+		if (!bSelfTestStarted)
+		{
+			bSelfTestStarted = true;
+			SelfTestTime = 0.0f;
+			SelfTestLogAccum = 1.0f;
+			CollPeakSpeed = 0.0f;
+			CollMaxZ = -BIG_NUMBER;
+			CollMinSep = BIG_NUMBER;
+			CollSepRamEnd = -1.0f;
+			CollTargetJitter = 0.0f;
+			bCollTargetPosInit = false;
+			SelfTestStartPos = Body->GetComponentLocation();
+			UE_LOG(LogTemp, Warning, TEXT("SELFTEST START | Mode=6 (NETCOLLISION) netmode=%d target=%s"),
+				(int32)(World ? World->GetNetMode() : NM_Standalone), CollTarget ? *CollTarget->GetName() : TEXT("WAITING"));
+		}
+
+		SelfTestTime += DeltaTime;
+		SelfTestLogAccum += DeltaTime;
+
+		// Wait for the target to replicate in, then: ram (full throttle), then retreat (reverse).
+		const bool bHaveTarget = (CollTarget != nullptr);
+		const bool bRam = bHaveTarget && (SelfTestTime > 2.0f && SelfTestTime <= 5.0f);
+		const bool bRetreat = bHaveTarget && (SelfTestTime > 5.0f);
+		ThrottleInput_External = bRetreat ? -1.0f : (bRam ? 1.0f : 0.0f);
+		SteerInput_External = 0.0f;
+		HandbrakeInput_External = 0.0f;
+
+		if (bHaveTarget && (bRam || bRetreat))
+		{
+			const FVector A = Body->GetComponentLocation();
+			const FVector B = CollTarget->GetActorLocation();
+			CollPeakSpeed = FMath::Max3(CollPeakSpeed, (float)Body->GetComponentVelocity().Size(), (float)CollTarget->GetVelocity().Size());
+			CollMaxZ = FMath::Max3(CollMaxZ, (float)A.Z, (float)B.Z);
+			CollMinSep = FMath::Min(CollMinSep, (float)FVector::Dist(A, B));
+			// Sim-proxy jitter: frame-to-frame movement of the target while in/around contact.
+			if (bCollTargetPosInit)
+			{
+				CollTargetJitter = FMath::Max(CollTargetJitter, (float)FVector::Dist(B, CollPrevTargetPos));
+			}
+			CollPrevTargetPos = B;
+			bCollTargetPosInit = true;
+		}
+		if (CollSepRamEnd < 0.0f && SelfTestTime > 5.0f && bHaveTarget)
+		{
+			CollSepRamEnd = (float)FVector::Dist(Body->GetComponentLocation(), CollTarget->GetActorLocation());
+		}
+
+		if (SelfTestLogAccum >= 0.5f)
+		{
+			SelfTestLogAccum = 0.0f;
+			const FVector A = Body->GetComponentLocation();
+			const FVector B = bHaveTarget ? CollTarget->GetActorLocation() : FVector::ZeroVector;
+			UE_LOG(LogTemp, Warning, TEXT("SELFTEST t=%.1f (%s) | Self=(%.0f,%.0f,%.0f) Target=(%.0f,%.0f,%.0f) Sep=%.0f"),
+				SelfTestTime, bRetreat ? TEXT("retreat") : (bRam ? TEXT("ram") : TEXT("wait")),
+				A.X, A.Y, A.Z, B.X, B.Y, B.Z, bHaveTarget ? (float)FVector::Dist(A, B) : -1.0f);
+		}
+
+		if (SelfTestTime >= 9.0f)
+		{
+			const float EndSep = bHaveTarget ? (float)FVector::Dist(Body->GetComponentLocation(), CollTarget->GetActorLocation()) : 0.0f;
+			const float SepGain = (CollSepRamEnd > 0.0f) ? (EndSep - CollSepRamEnd) : 0.0f;
+			const bool bFinite = FMath::IsFinite(CollPeakSpeed) && FMath::IsFinite(CollMinSep) && FMath::IsFinite(EndSep);
+			const float SpeedTol = 2500.0f;
+			const float SepTol = 150.0f;       // interpenetration if closer than this
+			const float JitterTol = 60.0f;     // sim-proxy frame jitter (sticking/fighting) cap
+			const float SepGainTol = 100.0f;   // must pull apart on retreat (no clinging)
+			const bool bPass = bHaveTarget && bFinite
+				&& (CollPeakSpeed <= SpeedTol)
+				&& (CollMinSep >= SepTol)
+				&& (CollTargetJitter <= JitterTol)
+				&& (SepGain >= SepGainTol);
+			UE_LOG(LogTemp, Warning, TEXT("SELFTEST NETCOLLISION | HaveTarget=%d PeakSpeed=%.0f (<=%.0f) MinSep=%.0f (>=%.0f) TargetJitter=%.1f (<=%.0f) SepGainOnRetreat=%.0f (>=%.0f) => %s"),
+				bHaveTarget ? 1 : 0, CollPeakSpeed, SpeedTol, CollMinSep, SepTol, CollTargetJitter, JitterTol, SepGain, SepGainTol, bPass ? TEXT("PASS") : TEXT("FAIL"));
+			UE_LOG(LogTemp, Warning, TEXT("SELFTEST DONE"));
+			FPlatformMisc::RequestExit(false);
+		}
+		return;
+	}
+
+	// Mode 7: DUAL-CLIENT head-on (both player cars are predicted on their owning client). Run with
+	// dedicated server + 2 clients; each client drives forward into the other, then reverses.
+	if (Mode == 7)
+	{
+		const UWorld* World = GetWorld();
+		if (!World || World->GetNetMode() == NM_Standalone)
+		{
+			return;
+		}
+		if (!IsLocallyControlled() || bIsNetTarget)
+		{
+			return;
+		}
+
+		if (!CollTarget)
+		{
+			// Remote player pawns are sim-proxies on this client — they have no local Controller.
+			for (TActorIterator<AModularCarPawn> It(GetWorld()); It; ++It)
+			{
+				if (*It != this && !It->IsLocallyControlled() && !It->bIsNetTarget)
+				{
+					CollTarget = *It;
+					break;
+				}
+			}
+		}
+
+		if (!bSelfTestStarted)
+		{
+			bSelfTestStarted = true;
+			SelfTestTime = 0.0f;
+			SelfTestLogAccum = 1.0f;
+			CollPeakSpeed = 0.0f;
+			CollMinSep = BIG_NUMBER;
+			CollSepRamEnd = -1.0f;
+			CollTargetJitter = 0.0f;
+			bCollTargetPosInit = false;
+			NetDualSepAtContact = 0.0f;
+			SelfTestStartPos = Body->GetComponentLocation();
+			UE_LOG(LogTemp, Warning, TEXT("SELFTEST START | Mode=7 (NETDUAL) netmode=%d target=%s"),
+				(int32)World->GetNetMode(), CollTarget ? *CollTarget->GetName() : TEXT("WAITING"));
+		}
+
+		SelfTestTime += DeltaTime;
+		SelfTestLogAccum += DeltaTime;
+
+		const bool bHaveTarget = (CollTarget != nullptr);
+		const bool bRam = bHaveTarget && (SelfTestTime > 2.0f && SelfTestTime <= 5.0f);
+		const bool bRetreat = bHaveTarget && (SelfTestTime > 5.0f);
+		ThrottleInput_External = 0.0f;
+		SteerInput_External = 0.0f;
+		HandbrakeInput_External = 0.0f;
+		if (bHaveTarget && (bRam || bRetreat))
+		{
+			FVector ToOther = CollTarget->GetActorLocation() - Body->GetComponentLocation();
+			ToOther.Z = 0.0f;
+			if (!ToOther.IsNearlyZero())
+			{
+				const FVector Fwd = Body->GetForwardVector().GetSafeNormal2D();
+				const FVector Dir = ToOther.GetSafeNormal();
+				const float SignedSteer = FMath::Clamp(FVector::CrossProduct(Fwd, Dir).Z, -1.0f, 1.0f);
+				const float Align = FVector::DotProduct(Fwd, Dir);
+				SteerInput_External = SignedSteer;
+				ThrottleInput_External = bRetreat ? -1.0f : FMath::Clamp(Align, 0.25f, 1.0f);
+			}
+			else if (bRetreat)
+			{
+				ThrottleInput_External = -1.0f;
+			}
+			else if (bRam)
+			{
+				ThrottleInput_External = 1.0f;
+			}
+		}
+
+		if (bHaveTarget && (bRam || bRetreat))
+		{
+			const FVector A = Body->GetComponentLocation();
+			const FVector B = CollTarget->GetActorLocation();
+			CollPeakSpeed = FMath::Max3(CollPeakSpeed, (float)Body->GetComponentVelocity().Size(), (float)CollTarget->GetVelocity().Size());
+			CollMinSep = FMath::Min(CollMinSep, (float)FVector::Dist(A, B));
+			if (bCollTargetPosInit)
+			{
+				CollTargetJitter = FMath::Max(CollTargetJitter, (float)FVector::Dist(B, CollPrevTargetPos));
+			}
+			CollPrevTargetPos = B;
+			bCollTargetPosInit = true;
+		}
+		if (NetDualSepAtContact <= 0.0f && bRam && bHaveTarget && CollMinSep < 500.0f)
+		{
+			NetDualSepAtContact = CollMinSep;
+		}
+		if (CollSepRamEnd < 0.0f && SelfTestTime > 5.0f && bHaveTarget)
+		{
+			CollSepRamEnd = (float)FVector::Dist(Body->GetComponentLocation(), CollTarget->GetActorLocation());
+		}
+
+		if (SelfTestLogAccum >= 0.5f)
+		{
+			SelfTestLogAccum = 0.0f;
+			const FVector A = Body->GetComponentLocation();
+			const FVector B = bHaveTarget ? CollTarget->GetActorLocation() : FVector::ZeroVector;
+			UE_LOG(LogTemp, Warning, TEXT("SELFTEST t=%.1f (%s) | Self=(%.0f,%.0f,%.0f) Other=(%.0f,%.0f,%.0f) Sep=%.0f"),
+				SelfTestTime, bRetreat ? TEXT("retreat") : (bRam ? TEXT("ram") : TEXT("wait")),
+				A.X, A.Y, A.Z, B.X, B.Y, B.Z, bHaveTarget ? (float)FVector::Dist(A, B) : -1.0f);
+		}
+
+		if (SelfTestTime >= 9.0f)
+		{
+			const float EndSep = bHaveTarget ? (float)FVector::Dist(Body->GetComponentLocation(), CollTarget->GetActorLocation()) : 0.0f;
+			const float SepGain = (CollSepRamEnd > 0.0f) ? (EndSep - CollSepRamEnd) : 0.0f;
+			const bool bFinite = FMath::IsFinite(CollPeakSpeed) && FMath::IsFinite(CollMinSep) && FMath::IsFinite(EndSep);
+			const float SpeedTol = 2500.0f;
+			const float SepTol = 150.0f;
+			const float JitterTol = 80.0f;
+			const float SepGainTol = 80.0f;
+			const bool bPass = bHaveTarget && bFinite
+				&& (CollPeakSpeed <= SpeedTol)
+				&& (CollMinSep >= SepTol)
+				&& (CollTargetJitter <= JitterTol)
+				&& (SepGain >= SepGainTol);
+			UE_LOG(LogTemp, Warning, TEXT("SELFTEST NETDUAL | HaveOther=%d PeakSpeed=%.0f MinSep=%.0f OtherJitter=%.1f SepGainOnRetreat=%.0f => %s"),
+				bHaveTarget ? 1 : 0, CollPeakSpeed, CollMinSep, CollTargetJitter, SepGain, bPass ? TEXT("PASS") : TEXT("FAIL"));
+			UE_LOG(LogTemp, Warning, TEXT("SELFTEST DONE"));
+			FPlatformMisc::RequestExit(false);
+		}
 		return;
 	}
 
@@ -656,6 +1320,8 @@ void AModularCarPawn::RunSelfTest(float DeltaTime)
 		RestPeakSpeed = 0.0f;
 		RestMinZ = BIG_NUMBER;
 		RestMaxZ = -BIG_NUMBER;
+		RestPeakAngSpeed = 0.0f;
+		RestMaxTilt = 0.0f;
 		SelfTestPeakYawRate = 0.0f;
 		UE_LOG(LogTemp, Warning, TEXT("SELFTEST START | Mode=%d (%s) StartPos=%s Wheels=%d"),
 			Mode, bRestTest ? TEXT("REST") : TEXT("DRIVE"), *SelfTestStartPos.ToString(), Wheels.Num());
@@ -691,6 +1357,11 @@ void AModularCarPawn::RunSelfTest(float DeltaTime)
 			RestPeakSpeed = FMath::Max(RestPeakSpeed, SpeedNow);
 			RestMinZ = FMath::Min(RestMinZ, ZNow);
 			RestMaxZ = FMath::Max(RestMaxZ, ZNow);
+			// Rotational jitter: angular speed and lean off vertical (cube/cylinders alone are dead
+			// stable, so any wobble here points at the cosmetic mesh's physics state interfering).
+			RestPeakAngSpeed = FMath::Max(RestPeakAngSpeed, (float)Body->GetPhysicsAngularVelocityInDegrees().Size());
+			const float UpZ = FMath::Clamp((float)GetActorUpVector().Z, -1.0f, 1.0f);
+			RestMaxTilt = FMath::Max(RestMaxTilt, FMath::RadiansToDegrees(FMath::Acos(UpZ)));
 		}
 		else
 		{
@@ -721,9 +1392,12 @@ void AModularCarPawn::RunSelfTest(float DeltaTime)
 			const float RestBand = RestMaxZ - RestMinZ;
 			const float SpeedTol = 5.0f;
 			const float BandTol = 3.0f;
-			const bool bPass = (RestPeakSpeed <= SpeedTol) && (RestBand <= BandTol);
-			UE_LOG(LogTemp, Warning, TEXT("SELFTEST REST | PeakSpeed=%.1f (<= %.0f) ZBand=%.1f (<= %.0f) => %s"),
-				RestPeakSpeed, SpeedTol, RestBand, BandTol, bPass ? TEXT("PASS") : TEXT("FAIL"));
+			const float AngSpeedTol = 5.0f; // deg/s
+			const float TiltTol = 2.0f;      // deg
+			const bool bPass = (RestPeakSpeed <= SpeedTol) && (RestBand <= BandTol)
+				&& (RestPeakAngSpeed <= AngSpeedTol) && (RestMaxTilt <= TiltTol);
+			UE_LOG(LogTemp, Warning, TEXT("SELFTEST REST | PeakSpeed=%.1f (<= %.0f) ZBand=%.1f (<= %.0f) PeakAngSpeed=%.1f (<= %.0f) MaxTilt=%.1f (<= %.0f) => %s"),
+				RestPeakSpeed, SpeedTol, RestBand, BandTol, RestPeakAngSpeed, AngSpeedTol, RestMaxTilt, TiltTol, bPass ? TEXT("PASS") : TEXT("FAIL"));
 		}
 		else
 		{

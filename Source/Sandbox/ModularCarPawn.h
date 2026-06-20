@@ -5,6 +5,7 @@
 #include "CoreMinimal.h"
 #include "GameFramework/Pawn.h"
 #include "Physics/NetworkPhysicsComponent.h"
+#include "Physics/NetworkPhysicsSettingsComponent.h"
 #include "ModularCarPawn.generated.h"
 
 class UStaticMeshComponent;
@@ -111,9 +112,13 @@ public:
 	float EngineForceTotal = 1000000.0f;
 	float LateralGripRate = 12.0f;
 	float LongitudinalGripRate = 4.0f;
+	float MaxGripAccel = 1500.0f;  // cm/s^2 cap on grip force/mass (friction circle) so cars can be shoved
 	float MaxYawRateRad = 0.0f;    // rad/s target yaw rate at full steer & full speed
 	float SteerRefSpeed = 350.0f;
 	float RestSpeedDeadzone = 3.0f;
+
+	// When false, skip drive/grip/steer (client sim-proxies: forces fight predicted-body contacts).
+	bool bApplyDriveForces = true;
 
 private:
 	float Throttle_Internal = 0.0f;
@@ -124,6 +129,28 @@ private:
 //----------------------------------------------------
 //--------------------- Wheel ------------------------
 //----------------------------------------------------
+
+// Replicated wheel layout (no component pointers — meshes are built locally from this).
+USTRUCT(BlueprintType)
+struct FModularCarWheelSpec
+{
+	GENERATED_BODY()
+
+	UPROPERTY()
+	FVector RelativeLocation = FVector::ZeroVector;
+
+	UPROPERTY()
+	bool bDriven = true;
+
+	UPROPERTY()
+	bool bSteering = false;
+
+	UPROPERTY()
+	float Radius = 35.0f;
+
+	UPROPERTY()
+	float Width = 20.0f;
+};
 
 USTRUCT(BlueprintType)
 struct FCarWheel
@@ -172,6 +199,7 @@ public:
 	virtual void SetupPlayerInputComponent(UInputComponent* PlayerInputComponent) override;
 	virtual void PawnClientRestart() override;
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
+	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
 
 	//-------------------- Runtime build API --------------------
 
@@ -186,6 +214,9 @@ public:
 
 	UFUNCTION(BlueprintCallable, Category = "Modular Car")
 	int32 GetNumWheels() const { return Wheels.Num(); }
+
+	UFUNCTION(BlueprintCallable, Category = "Modular Car")
+	int32 GetSymmetricWheelPairCount() const { return ReplicatedWheelSpecs.Num() / 2; }
 
 	//-------------------- Input (feed the predicted sim) --------------------
 
@@ -229,6 +260,10 @@ protected:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Modular Car|Body")
 	bool bSpawnDefaultWheels = true;
 
+	// Max axles (each axle = left + right wheel). P adds the next pair, L removes the last pair.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Modular Car|Body", meta = (ClampMin = "0", ClampMax = "16"))
+	int32 MaxSymmetricWheelPairs = 8;
+
 	// Angular damping tames chassis tilt under acceleration; a little linear damping settles creep.
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Modular Car|Body")
 	float ChassisAngularDamping = 3.0f;
@@ -255,19 +290,26 @@ protected:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Modular Car|Drive", meta = (ClampMin = "0.0"))
 	float LongitudinalGripRate = 4.0f;
 
+	// Friction-circle cap on grip (cm/s^2): max grip force = MaxGripAccel * mass. Limits how hard the
+	// car resists side/forward slip, so a ramming car can shove it instead of the physics breaking.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Modular Car|Drive", meta = (ClampMin = "0.0"))
+	float MaxGripAccel = 1500.0f;
+
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Modular Car|Drive")
 	float RestSpeedDeadzone = 3.0f;
 
 	UPROPERTY(EditAnywhere, Category = "Modular Car|Debug")
-	bool bDebugDrive = true;
+	bool bDebugDrive = false;
 
 	//-------------------- Cosmetic meshes --------------------
 	// Real car art (SportsCar_SM body + SportsCarWheel_SM wheels) is laid over the cube/cylinder
 	// collision proxies, which are hidden but still simulate. The tuned "box on wheels" physics is
 	// untouched. Tune these to line the art up with the proxies (offline asset sizes are unknown).
 
+	// Rolled back to the plain cube chassis + cylinder wheels (the original look). Set true to overlay
+	// the cosmetic skeletal car (SKM_SportsCar) again.
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Modular Car|Visuals")
-	bool bUseVisualMeshes = true;
+	bool bUseVisualMeshes = false;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Modular Car|Visuals")
 	FVector BodyVisualScale = FVector(1.0f, 1.0f, 1.0f);
@@ -282,6 +324,8 @@ private:
 	void SettleOntoGround();
 	void PollKeyboard();
 	void RunSelfTest(float DeltaTime);
+	bool ShouldApplyDriveForces() const;
+	void UpdateAsyncDriveForcesFlag();
 
 	void EnsureInputAssets();
 	void Input_Throttle(const FInputActionValue& Value);
@@ -290,12 +334,34 @@ private:
 
 	UStaticMeshComponent* CreateWheelMesh(const FVector& RelLoc, float Radius, float Width);
 	void ApplyBodyVisual();
+	void RefreshDriveTuningFromWheels();
+	void ApplyReplicatedWheelLayout();
+	void InitializeDefaultSymmetricWheelSpecs();
+	FVector GetSymmetricPairWheelLocation(int32 PairIndex, bool bLeftSide) const;
+	bool AddSymmetricWheelPairAuthority();
+	bool RemoveSymmetricWheelPairAuthority();
+	void AppendSymmetricPairSpecs(int32 PairIndex);
+
+	UFUNCTION(Server, Reliable)
+	void ServerRequestAddSymmetricWheelPair();
+
+	UFUNCTION(Server, Reliable)
+	void ServerRequestRemoveSymmetricWheelPair();
+
+	UFUNCTION()
+	void OnRep_ReplicatedWheelSpecs();
+
+	UPROPERTY(ReplicatedUsing = OnRep_ReplicatedWheelSpecs)
+	TArray<FModularCarWheelSpec> ReplicatedWheelSpecs;
 
 	// Networked physics
 	FModularCarAsync* CarAsync = nullptr;
 
 	UPROPERTY()
 	TObjectPtr<UNetworkPhysicsComponent> NetworkPhysicsComponent = nullptr;
+
+	UPROPERTY()
+	TObjectPtr<UNetworkPhysicsSettingsComponent> NetworkPhysicsSettingsComponent = nullptr;
 
 	UPROPERTY()
 	TObjectPtr<UInputMappingContext> InputMapping;
@@ -333,5 +399,29 @@ private:
 	float RestPeakSpeed = 0.0f;
 	float RestMinZ = 0.0f;
 	float RestMaxZ = 0.0f;
+	float RestPeakAngSpeed = 0.0f;    // deg/s, rest test: rotational jitter / wobble at rest
+	float RestMaxTilt = 0.0f;         // deg, rest test: max lean of the chassis off vertical
 	float SelfTestPeakYawRate = 0.0f; // deg/s, drive test: how hard the car actually turns
+
+	// Collision self-test (mode 4): ram a second spawned car and check the physics stays sane.
+	UPROPERTY()
+	TObjectPtr<AModularCarPawn> CollTarget = nullptr;
+	FVector CollTargetStart = FVector::ZeroVector;
+	float CollPeakSpeed = 0.0f;
+	float CollMaxZ = 0.0f;
+	float CollMinSep = 0.0f;
+	float CollSepRamEnd = 0.0f; // separation when the ram phase ends (mode 5: clinging check)
+
+	// Networked collision test (mode 6): server spawns a target ahead of the player car; the client
+	// rams it (predicted body vs sim-proxy) and we measure sticking on the client.
+	bool bIsNetTarget = false;        // set on the server-spawned target so it never orchestrates
+	bool bNetServerSpawned = false;   // server: target spawned once
+	float NetTime = 0.0f;             // server-side timer for deferred spawn
+	float CollTargetJitter = 0.0f;    // client: peak frame-to-frame move of the sim-proxy target
+	FVector CollPrevTargetPos = FVector::ZeroVector;
+	bool bCollTargetPosInit = false;
+
+	// Mode 7: two clients, both predicted — head-on collision then retreat (mutual prediction).
+	bool bNetDualClientReady = false;
+	float NetDualSepAtContact = 0.0f;
 };
