@@ -616,21 +616,10 @@ void AModularCarPawn::ApplyNetworkPhysicsReplicationMode()
 
 void AModularCarPawn::EnsureNetworkPhysicsHistory()
 {
-	if (bNetworkPhysicsHistoryCreated || !CarAsync || !NetworkPhysicsComponent)
-	{
-		return;
-	}
-
-	// Compound body must exist (wheels welded) before registering network physics history.
-	if (ReplicatedWheelSpecs.Num() == 0 || Wheels.Num() == 0)
-	{
-		return;
-	}
-
-	ApplyNetworkPhysicsReplicationMode();
-	NetworkPhysicsComponent->CreateDataHistory<FNetInputModularCar, FNetStateModularCar>(CarAsync);
-	bNetworkPhysicsHistoryCreated = true;
-	RefreshPhysicsBindings();
+	// History must be created from RefreshPhysicsBindings on the next tick after wheel weld —
+	// same-frame CreateDataHistory after ApplyReplicatedWheelLayout binds a stale handle and
+	// freezes the default 4-wheel car until a later rebind (e.g. pressing P to add wheels).
+	ScheduleRefreshPhysicsBindings();
 }
 
 void AModularCarPawn::PostNetReceiveRole()
@@ -663,6 +652,26 @@ void AModularCarPawn::RefreshPhysicsBindings()
 	}
 
 	const Chaos::FConstPhysicsObjectHandle BodyHandle = Body->GetPhysicsObjectByName(NAME_None);
+	if (!BodyHandle)
+	{
+		return;
+	}
+
+	// Deferred init: compound body + valid handle only after wheel weld settles (next tick).
+	if (!bNetworkPhysicsHistoryCreated && CarAsync && NetworkPhysicsComponent
+		&& ReplicatedWheelSpecs.Num() > 0 && Wheels.Num() > 0)
+	{
+		ApplyNetworkPhysicsReplicationMode();
+		NetworkPhysicsComponent->CreateDataHistory<FNetInputModularCar, FNetStateModularCar>(CarAsync);
+		bNetworkPhysicsHistoryCreated = true;
+		RefreshDriveTuningFromWheels();
+	}
+
+	if (!bNetworkPhysicsHistoryCreated)
+	{
+		return;
+	}
+
 	const bool bDriveRole = ShouldApplyDriveForces();
 
 	if (CarAsync)
@@ -707,7 +716,6 @@ void AModularCarPawn::OnRep_ReplicatedWheelSpecs()
 {
 	InitializeChassisPhysics();
 	ApplyReplicatedWheelLayout();
-	EnsureNetworkPhysicsHistory();
 }
 
 bool AModularCarPawn::AddSymmetricWheelPairAuthority()
@@ -860,7 +868,7 @@ void AModularCarPawn::PostInitializeComponents()
 						CarAsync->RestSpeedDeadzone = RestSpeedDeadzone;
 						CarAsync->bApplyDriveForces = ShouldApplyDriveForces();
 
-						EnsureNetworkPhysicsHistory();
+						ScheduleRefreshPhysicsBindings();
 					}
 				}
 			}
