@@ -273,7 +273,7 @@ protected:
 	float ChassisLinearDamping = 0.2f;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Modular Car|Drive")
-	float EngineForcePerWheel = 250000.0f;
+	float EngineForcePerWheel = 750000.0f;
 
 	// Steering = target yaw rate (deg/s) at full steer, scaled by speed; the car only turns while
 	// rolling and reaches full turn rate at SteerRefSpeed (cm/s). This IS the "how sharp it turns"

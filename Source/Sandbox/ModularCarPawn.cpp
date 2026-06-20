@@ -280,8 +280,8 @@ AModularCarPawn::AModularCarPawn()
 
 	SpringArm = CreateDefaultSubobject<USpringArmComponent>(TEXT("SpringArm"));
 	SpringArm->SetupAttachment(Body);
-	SpringArm->TargetArmLength = 900.0f;
-	SpringArm->SocketOffset = FVector(0.0f, 0.0f, 250.0f);
+	SpringArm->TargetArmLength = 2700.0f;
+	SpringArm->SocketOffset = FVector(0.0f, 0.0f, 750.0f);
 	SpringArm->bDoCollisionTest = false;
 	SpringArm->bEnableCameraLag = true;
 	SpringArm->CameraLagSpeed = 5.0f;
