@@ -33,6 +33,7 @@
 #include "Chaos/PhysicsObjectInterface.h"
 #include "Chaos/PhysicsObjectInternalInterface.h"
 #include "Net/UnrealNetwork.h"
+#include "TimerManager.h"
 
 static TAutoConsoleVariable<int32> CVarCarSelfTest(
 	TEXT("car.SelfTest"),
@@ -94,7 +95,10 @@ static void ApplyNeverSleepToParticle(Chaos::FConstPhysicsObjectHandle PhysicsOb
 
 void FModularCarAsync::OnPostInitialize_Internal()
 {
-	ApplyNeverSleepToParticle(PhysicsObject);
+	if (bApplyDriveForces)
+	{
+		ApplyNeverSleepToParticle(PhysicsObject);
+	}
 }
 
 void FModularCarAsync::ProcessInputs_Internal(int32 PhysicsStep)
@@ -132,8 +136,11 @@ void FModularCarAsync::OnPreSimulate_Internal()
 		return;
 	}
 
-	// Welded wheel rebuilds recreate the compound body; NeverSleep must be re-applied every step.
-	ParticleHandle->SetSleepType(Chaos::ESleepType::NeverSleep);
+	// Predicted/authority only — sim-proxies must follow replicated state, not fight it with NeverSleep.
+	if (bApplyDriveForces)
+	{
+		ParticleHandle->SetSleepType(Chaos::ESleepType::NeverSleep);
+	}
 
 	// Outside resimulation use the freshest local input (and keep *_Internal in sync for the
 	// standalone case, where the rewind machinery doesn't drive ProcessInputs_Internal). During a
@@ -312,6 +319,32 @@ AModularCarPawn::AModularCarPawn()
 	}
 }
 
+void AModularCarPawn::InitializeChassisPhysics()
+{
+	if (!Body || bChassisPhysicsInitialized)
+	{
+		return;
+	}
+	bChassisPhysicsInitialized = true;
+
+	Body->SetRelativeScale3D(BodyExtent / 100.0f);
+	Body->SetMassOverrideInKg(NAME_None, BodyMassKg, true);
+	Body->SetSimulatePhysics(true);
+	Body->SetEnableGravity(true);
+	Body->SetLinearDamping(ChassisLinearDamping);
+	Body->SetAngularDamping(ChassisAngularDamping);
+
+	if (!ChassisPhysMaterial)
+	{
+		ChassisPhysMaterial = NewObject<UPhysicalMaterial>(this, TEXT("ModularCarChassisPM"));
+		ChassisPhysMaterial->Friction = 0.2f;
+		ChassisPhysMaterial->Restitution = 0.0f;
+		ChassisPhysMaterial->bOverrideFrictionCombineMode = true;
+		ChassisPhysMaterial->FrictionCombineMode = EFrictionCombineMode::Min;
+	}
+	Body->SetPhysMaterialOverride(ChassisPhysMaterial);
+}
+
 void AModularCarPawn::BeginPlay()
 {
 	Super::BeginPlay();
@@ -330,37 +363,24 @@ void AModularCarPawn::BeginPlay()
 		UE_LOG(LogTemp, Warning, TEXT("VISUALLOAD | SKM_SportsCar=%s"), CarBodyMesh ? TEXT("OK") : TEXT("FAIL"));
 	}
 
-	Body->SetRelativeScale3D(BodyExtent / 100.0f);
-	Body->SetMassOverrideInKg(NAME_None, BodyMassKg, true);
-	Body->SetSimulatePhysics(true);
-	Body->SetEnableGravity(true);
-	Body->SetLinearDamping(ChassisLinearDamping);
-	Body->SetAngularDamping(ChassisAngularDamping);
+	InitializeChassisPhysics();
 
-	// Low-friction chassis so OUR drive/grip forces govern motion. Friction combine = Min so the
-	// low value wins over the ground's default (otherwise it averages back up and glues the car).
-	if (!ChassisPhysMaterial)
-	{
-		ChassisPhysMaterial = NewObject<UPhysicalMaterial>(this, TEXT("ModularCarChassisPM"));
-		ChassisPhysMaterial->Friction = 0.2f;
-		ChassisPhysMaterial->Restitution = 0.0f;
-		ChassisPhysMaterial->bOverrideFrictionCombineMode = true;
-		ChassisPhysMaterial->FrictionCombineMode = EFrictionCombineMode::Min;
-	}
-	Body->SetPhysMaterialOverride(ChassisPhysMaterial);
-
-	Body->WakeAllRigidBodies();
-
+	// Specs can replicate after PostInitializeComponents on clients — build wheels once they arrive.
 	if (HasAuthority() && bSpawnDefaultWheels && ReplicatedWheelSpecs.Num() == 0)
 	{
 		InitializeDefaultSymmetricWheelSpecs();
 	}
-	if (ReplicatedWheelSpecs.Num() > 0)
+	if (ReplicatedWheelSpecs.Num() > 0 && Wheels.Num() == 0)
 	{
 		ApplyReplicatedWheelLayout();
 	}
 
-	SettleOntoGround();
+	// Only the server may teleport/settle — clients (especially sim-proxies) must follow replication.
+	if (HasAuthority())
+	{
+		Body->WakeAllRigidBodies();
+		SettleOntoGround();
+	}
 
 	// Hide the collision cube once the car body art is in place (collision/simulation unaffected).
 	if (bUseVisualMeshes && CarBodyMesh)
@@ -368,11 +388,12 @@ void AModularCarPawn::BeginPlay()
 		Body->SetVisibility(false);
 	}
 	ApplyBodyVisual();
-	RefreshPhysicsBindings();
+	ScheduleRefreshPhysicsBindings();
 
 	RefreshDriveTuningFromWheels();
 
-	UE_LOG(LogTemp, Warning, TEXT("CARSETUP | Sim=%d Grav=%d Mass=%.0f Wheels=%d Net=%d EngineForce=%.0f"),
+	UE_LOG(LogTemp, Warning, TEXT("CARSETUP | Role=%d LC=%d Sim=%d Grav=%d Mass=%.0f Wheels=%d Net=%d EngineForce=%.0f"),
+		(int32)GetLocalRole(), IsLocallyControlled() ? 1 : 0,
 		Body->IsSimulatingPhysics() ? 1 : 0, Body->IsGravityEnabled() ? 1 : 0,
 		Body->GetMass(), Wheels.Num(), NetworkPhysicsComponent ? 1 : 0,
 		CarAsync ? CarAsync->EngineForceTotal : 0.0f);
@@ -570,8 +591,22 @@ void AModularCarPawn::ApplyReplicatedWheelLayout()
 		Wheels.Add(Wheel);
 	}
 
-	RefreshPhysicsBindings();
+	ScheduleRefreshPhysicsBindings();
 	RefreshDriveTuningFromWheels();
+}
+
+void AModularCarPawn::ScheduleRefreshPhysicsBindings()
+{
+	if (!GetWorld() || bPhysicsRefreshScheduled)
+	{
+		return;
+	}
+	bPhysicsRefreshScheduled = true;
+	GetWorld()->GetTimerManager().SetTimerForNextTick(FTimerDelegate::CreateWeakLambda(this, [this]()
+	{
+		bPhysicsRefreshScheduled = false;
+		RefreshPhysicsBindings();
+	}));
 }
 
 void AModularCarPawn::RefreshPhysicsBindings()
@@ -582,11 +617,15 @@ void AModularCarPawn::RefreshPhysicsBindings()
 	}
 
 	const Chaos::FConstPhysicsObjectHandle BodyHandle = Body->GetPhysicsObjectByName(NAME_None);
+	const bool bDriveRole = ShouldApplyDriveForces();
 
 	if (CarAsync)
 	{
 		CarAsync->PhysicsObject = BodyHandle;
-		ApplyNeverSleepToParticle(BodyHandle);
+		if (bDriveRole)
+		{
+			ApplyNeverSleepToParticle(BodyHandle);
+		}
 	}
 
 	// Welding wheels rebuilds the compound body; NetworkPhysicsComponent must track the new handle
@@ -596,11 +635,15 @@ void AModularCarPawn::RefreshPhysicsBindings()
 		NetworkPhysicsComponent->SetPhysicsObject(BodyHandle);
 	}
 
-	Body->WakeAllRigidBodies();
+	if (bDriveRole || HasAuthority())
+	{
+		Body->WakeAllRigidBodies();
+	}
 }
 
 void AModularCarPawn::OnRep_ReplicatedWheelSpecs()
 {
+	InitializeChassisPhysics();
 	ApplyReplicatedWheelLayout();
 }
 
@@ -721,6 +764,18 @@ void AModularCarPawn::PostInitializeComponents()
 {
 	Super::PostInitializeComponents();
 
+	InitializeChassisPhysics();
+
+	// Server: weld wheels before registering network physics so the initial handle is the compound body.
+	if (HasAuthority() && bSpawnDefaultWheels && ReplicatedWheelSpecs.Num() == 0)
+	{
+		InitializeDefaultSymmetricWheelSpecs();
+	}
+	if (ReplicatedWheelSpecs.Num() > 0)
+	{
+		ApplyReplicatedWheelLayout();
+	}
+
 	if (UPrimitiveComponent* Root = Cast<UPrimitiveComponent>(GetRootComponent()))
 	{
 		if (UWorld* World = GetWorld())
@@ -734,7 +789,6 @@ void AModularCarPawn::PostInitializeComponents()
 					{
 						CarAsync->PhysicsObject = Root->GetPhysicsObjectByName(NAME_None);
 
-						// Copy tuning into the async object (constant + identical server/client).
 						CarAsync->LateralGripRate = LateralGripRate;
 						CarAsync->LongitudinalGripRate = LongitudinalGripRate;
 						CarAsync->MaxGripAccel = MaxGripAccel;
@@ -746,6 +800,7 @@ void AModularCarPawn::PostInitializeComponents()
 						if (NetworkPhysicsComponent)
 						{
 							NetworkPhysicsComponent->CreateDataHistory<FNetInputModularCar, FNetStateModularCar>(CarAsync);
+							RefreshPhysicsBindings();
 						}
 					}
 				}

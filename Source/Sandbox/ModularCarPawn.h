@@ -335,8 +335,10 @@ private:
 	UStaticMeshComponent* CreateWheelMesh(const FVector& RelLoc, float Radius, float Width);
 	void ApplyBodyVisual();
 	void RefreshDriveTuningFromWheels();
+	void InitializeChassisPhysics();
 	void ApplyReplicatedWheelLayout();
 	void RefreshPhysicsBindings();
+	void ScheduleRefreshPhysicsBindings();
 	void InitializeDefaultSymmetricWheelSpecs();
 	FVector GetSymmetricPairWheelLocation(int32 PairIndex, bool bLeftSide) const;
 	bool AddSymmetricWheelPairAuthority();
@@ -357,6 +359,8 @@ private:
 
 	// Networked physics
 	FModularCarAsync* CarAsync = nullptr;
+	bool bChassisPhysicsInitialized = false;
+	bool bPhysicsRefreshScheduled = false;
 
 	UPROPERTY()
 	TObjectPtr<UNetworkPhysicsComponent> NetworkPhysicsComponent = nullptr;
