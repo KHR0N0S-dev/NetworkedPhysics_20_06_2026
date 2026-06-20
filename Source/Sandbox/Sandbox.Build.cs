@@ -20,6 +20,7 @@ public class Sandbox : ModuleRules
 			"UMG",
 			"Slate",
 			"Chaos",
+			"PhysicsCore",
 			"ChaosVehicles",
 			"ChaosVehiclesCore",
 			"ChaosVehiclesEngine",

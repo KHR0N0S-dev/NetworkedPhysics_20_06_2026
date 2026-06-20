@@ -55,3 +55,7 @@
 .idea
 
 /.vsconfig
+
+# Transient build/scratch logs (Claude Code session artifacts)
+/build_*.log
+/make_level.log

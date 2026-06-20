@@ -8,8 +8,8 @@ public class SandboxEditorTarget : TargetRules
 	public SandboxEditorTarget(TargetInfo Target) : base(Target)
 	{
 		Type = TargetType.Editor;
-		IncludeOrderVersion = EngineIncludeOrderVersion.Unreal5_8;
-		DefaultBuildSettings = BuildSettingsVersion.V7;
+		IncludeOrderVersion = EngineIncludeOrderVersion.Latest;
+		DefaultBuildSettings = BuildSettingsVersion.Latest;
 		ExtraModuleNames.Add("Sandbox");
 	}
 }
