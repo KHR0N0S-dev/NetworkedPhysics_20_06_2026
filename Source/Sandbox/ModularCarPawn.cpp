@@ -321,6 +321,9 @@ AModularCarPawn::AModularCarPawn()
 	// its transform every Tick for smooth camera follow without SpringArm's lag fighting physics/resim.
 	CameraTarget = CreateDefaultSubobject<USceneComponent>(TEXT("CameraTarget"));
 	CameraTarget->SetupAttachment(Body);
+	// World-space chase: ignore Body pitch/roll jitter from physics and suspension.
+	CameraTarget->SetUsingAbsoluteLocation(true);
+	CameraTarget->SetUsingAbsoluteRotation(true);
 
 	SpringArm->SetupAttachment(CameraTarget);
 	SpringArm->TargetArmLength = 2700.0f;
@@ -329,9 +332,10 @@ AModularCarPawn::AModularCarPawn()
 	SpringArm->bEnableCameraLag = false;
 	SpringArm->CameraLagSpeed = 20.0f;
 
+	// Fixed boom pitch only — yaw comes from CameraTarget smoothing, not physics roll/pitch.
 	SpringArm->bInheritPitch = false;
 	SpringArm->bInheritRoll = false;
-	SpringArm->bInheritYaw = true;
+	SpringArm->bInheritYaw = false;
 	SpringArm->SetRelativeRotation(FRotator(-20.0f, 0.0f, 0.0f));
 
 	Camera = CreateDefaultSubobject<UCameraComponent>(TEXT("Camera"));
@@ -651,6 +655,7 @@ void AModularCarPawn::BuildWheelAssembly(FCarWheel& Wheel)
 		(2.0f * Wheel.Radius) / 100.0f,
 		(2.0f * Wheel.Radius) / 100.0f,
 		Wheel.Width / 100.0f);
+	// Roll 90: cylinder axis along Y (axle). Driving spin is Pitch (rotation around Y).
 	Comp->SetRelativeRotation(FRotator(0.0f, 0.0f, 90.0f));
 	Comp->SetRelativeScale3D(Scale);
 
@@ -742,7 +747,7 @@ void AModularCarPawn::UpdateWheelVisuals(float DeltaTime)
 			Wheel.VisualSpinAngle += (FwdSpeed / Circumference) * (2.0f * PI) * DeltaTime;
 			Wheel.VisualSpinAngle = FMath::Fmod(Wheel.VisualSpinAngle, 2.0f * PI);
 			const float SpinDeg = FMath::RadiansToDegrees(Wheel.VisualSpinAngle);
-			Wheel.Mesh->SetRelativeRotation(FRotator(0.0f, SpinDeg, 90.0f));
+			Wheel.Mesh->SetRelativeRotation(FRotator(SpinDeg, 0.0f, 90.0f));
 		}
 	}
 }
