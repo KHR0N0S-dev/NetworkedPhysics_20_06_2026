@@ -256,16 +256,23 @@ void FModularCarAsync::OnPreSimulate_Internal()
 	// We approximate torque from desired yaw accel (error * gain). Gain tuned for responsiveness without oscillation.
 	if (FMath::Abs(Steer) > 0.01f && MaxYawRateRad > 0.0f)
 	{
-		const Chaos::FReal SpeedFrac = FMath::Clamp(FwdVel / FMath::Max((Chaos::FReal)SteerRefSpeed, (Chaos::FReal)1.0), (Chaos::FReal)-1.0, (Chaos::FReal)1.0);
+		Chaos::FReal SpeedFrac = FMath::Clamp(
+			FMath::Abs(FwdVel) / FMath::Max((Chaos::FReal)SteerRefSpeed, (Chaos::FReal)1.0),
+			(Chaos::FReal)0.0, (Chaos::FReal)1.0);
+
+		const Chaos::FReal MinFrac = FMath::Clamp((Chaos::FReal)MinSteerSpeedFraction, (Chaos::FReal)0.0, (Chaos::FReal)1.0);
+		if (SpeedFrac < MinFrac && (FMath::Abs(Throttle) > 0.01f || FMath::Abs(FwdVel) > (Chaos::FReal)RestSpeedDeadzone))
+		{
+			SpeedFrac = MinFrac;
+		}
+
 		const Chaos::FReal TargetYaw = Steer * SpeedFrac * MaxYawRateRad;
 		Chaos::FVec3 W = ParticleHandle->GetW();
 		const Chaos::FReal YawError = TargetYaw - W.Z;
-		// Simple proportional torque. Mass approx via 1 (torque units); scale to feel like previous yaw rate.
-		// Higher gain = snappier but can introduce jitter; lower = smoother.
-		const Chaos::FReal YawTorqueGain = 2000.0; // tuned value; adjust if needed
+		const Chaos::FReal YawTorqueGain = 12000.0;
 		Chaos::FVec3 Torque(0.0);
 		Torque.Z = YawError * YawTorqueGain;
-		ParticleHandle->AddTorque(Torque, true /* bAllowSubstepping */);
+		ParticleHandle->AddTorque(Torque, true);
 	}
 }
 
@@ -392,10 +399,10 @@ void AModularCarPawn::InitializeChassisPhysics()
 		ChassisPhysMaterial->FrictionCombineMode = EFrictionCombineMode::Min;
 	}
 	Body->SetPhysMaterialOverride(ChassisPhysMaterial);
-	ConfigureModularCarPartCollision(Body);
+	ConfigureChassisCollision(Body);
 }
 
-void AModularCarPawn::ConfigureModularCarPartCollision(UStaticMeshComponent* Comp) const
+void AModularCarPawn::ConfigureChassisCollision(UStaticMeshComponent* Comp) const
 {
 	if (!Comp)
 	{
@@ -405,7 +412,18 @@ void AModularCarPawn::ConfigureModularCarPartCollision(UStaticMeshComponent* Com
 	Comp->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
 	Comp->SetCollisionObjectType(ECC_PhysicsBody);
 	Comp->SetCollisionResponseToAllChannels(ECR_Block);
-	// Ground contact is raycast suspension only — wheels/chassis must not rest on or snag terrain.
+}
+
+void AModularCarPawn::ConfigureWheelCollision(UStaticMeshComponent* Comp) const
+{
+	if (!Comp)
+	{
+		return;
+	}
+
+	Comp->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+	Comp->SetCollisionObjectType(ECC_PhysicsBody);
+	Comp->SetCollisionResponseToAllChannels(ECR_Block);
 	Comp->SetCollisionResponseToChannel(ECC_WorldStatic, ECR_Ignore);
 	Comp->SetCollisionResponseToChannel(ECC_WorldDynamic, ECR_Ignore);
 }
@@ -601,38 +619,132 @@ void AModularCarPawn::UpdatePendingGroundSettle(float DeltaTime)
 	}
 }
 
-UStaticMeshComponent* AModularCarPawn::CreateWheelMesh(const FVector& RelLoc, float Radius, float Width)
+void AModularCarPawn::BuildWheelAssembly(FCarWheel& Wheel)
 {
+	if (!Body || !CylinderMesh)
+	{
+		return;
+	}
+
+	USceneComponent* Pivot = NewObject<USceneComponent>(this);
+	if (!Pivot)
+	{
+		return;
+	}
+	Pivot->SetupAttachment(Body);
+	Pivot->SetMobility(EComponentMobility::Movable);
+	Pivot->RegisterComponent();
+	Pivot->SetRelativeLocation(Wheel.RelativeLocation);
+
 	UStaticMeshComponent* Comp = NewObject<UStaticMeshComponent>(this);
 	if (!Comp)
 	{
-		return nullptr;
+		Pivot->DestroyComponent();
+		return;
 	}
 	Comp->SetStaticMesh(CylinderMesh);
 	Comp->SetMobility(EComponentMobility::Movable);
-	Comp->SetupAttachment(Body);
+	Comp->SetupAttachment(Pivot);
 	Comp->RegisterComponent();
-	// Welded into the chassis compound: wheels collide with body, each other (same rigid body), and
-	// other vehicles — but never the ground (WorldStatic/WorldDynamic ignored on all car parts).
-	Comp->AttachToComponent(Body, FAttachmentTransformRules(EAttachmentRule::KeepRelative, true));
 
-	// Cylinder basic shape: radius ~50 in local XY, height 100 along local Z.
-	// Roll 90 deg so the axle (local Z) points along the car's Y (sideways).
-	const FVector Scale((2.0f * Radius) / 100.0f, (2.0f * Radius) / 100.0f, Width / 100.0f);
-	Comp->SetRelativeLocationAndRotation(RelLoc, FRotator(0.0f, 0.0f, 90.0f));
+	const FVector Scale(
+		(2.0f * Wheel.Radius) / 100.0f,
+		(2.0f * Wheel.Radius) / 100.0f,
+		Wheel.Width / 100.0f);
+	Comp->SetRelativeRotation(FRotator(0.0f, 0.0f, 90.0f));
 	Comp->SetRelativeScale3D(Scale);
 
-	ConfigureModularCarPartCollision(Comp);
+	ConfigureWheelCollision(Comp);
 	if (ChassisPhysMaterial)
 	{
 		Comp->SetPhysMaterialOverride(ChassisPhysMaterial);
 	}
-	// The cylinder is the support/collision; hide it once the cosmetic car covers everything.
 	if (bUseVisualMeshes && CarBodyMesh)
 	{
 		Comp->SetVisibility(false);
 	}
-	return Comp;
+
+	Wheel.Pivot = Pivot;
+	Wheel.Mesh = Comp;
+	Wheel.VisualSpinAngle = 0.0f;
+}
+
+int32 AModularCarPawn::FindSuspensionIndexForWheelLocation(const FVector& LocalLocation) const
+{
+	if (!CarAsync)
+	{
+		return INDEX_NONE;
+	}
+
+	int32 BestIdx = INDEX_NONE;
+	float BestDistSq = 100.0f * 100.0f;
+	for (int32 Idx = 0; Idx < CarAsync->WheelSuspensions.Num(); ++Idx)
+	{
+		const float DistSq = FVector::DistSquared(CarAsync->WheelSuspensions[Idx].LocalRestPosition, LocalLocation);
+		if (DistSq < BestDistSq)
+		{
+			BestDistSq = DistSq;
+			BestIdx = Idx;
+		}
+	}
+	return BestIdx;
+}
+
+void AModularCarPawn::UpdateWheelVisuals(float DeltaTime)
+{
+	if (!Body || Wheels.IsEmpty())
+	{
+		return;
+	}
+
+	const FVector BodyVel = Body->GetComponentVelocity();
+	const FVector Fwd = Body->GetForwardVector();
+	const float FwdSpeed = FVector::DotProduct(BodyVel, Fwd);
+	const float TargetSteerDeg = SteerInput_External * MaxVisualSteerAngle;
+
+	const TArray<ModularCarChaosSuspension::FSuspensionHitCache>* Hits = nullptr;
+	if (CarAsync && CarAsync->SuspensionHitCache.Num() == CarAsync->WheelSuspensions.Num())
+	{
+		Hits = &CarAsync->SuspensionHitCache;
+	}
+
+	for (FCarWheel& Wheel : Wheels)
+	{
+		if (!Wheel.Pivot)
+		{
+			continue;
+		}
+
+		float CompressionOffset = 0.0f;
+		const int32 SusIdx = Wheel.SuspensionIndex;
+		if (Hits && Hits->IsValidIndex(SusIdx) && (*Hits)[SusIdx].bBlockingHit)
+		{
+			const ModularCarChaosSuspension::FSuspensionHitCache& Hit = (*Hits)[SusIdx];
+			const float TraceSpan = SuspensionMaxRaise + SuspensionMaxDrop + Wheel.Radius;
+			const float ContactLength = Hit.Distance;
+			CompressionOffset = FMath::Clamp(TraceSpan - ContactLength, 0.0f, SuspensionMaxDrop + SuspensionMaxRaise);
+		}
+
+		FVector PivotLoc = Wheel.RelativeLocation;
+		PivotLoc.Z -= CompressionOffset;
+		Wheel.Pivot->SetRelativeLocation(PivotLoc);
+
+		FRotator PivotRot = FRotator::ZeroRotator;
+		if (Wheel.bSteering)
+		{
+			PivotRot.Yaw = TargetSteerDeg;
+		}
+		Wheel.Pivot->SetRelativeRotation(PivotRot);
+
+		if (Wheel.Mesh)
+		{
+			const float Circumference = 2.0f * PI * FMath::Max(Wheel.Radius, 1.0f);
+			Wheel.VisualSpinAngle += (FwdSpeed / Circumference) * (2.0f * PI) * DeltaTime;
+			Wheel.VisualSpinAngle = FMath::Fmod(Wheel.VisualSpinAngle, 2.0f * PI);
+			const float SpinDeg = FMath::RadiansToDegrees(Wheel.VisualSpinAngle);
+			Wheel.Mesh->SetRelativeRotation(FRotator(0.0f, SpinDeg, 90.0f));
+		}
+	}
 }
 
 void AModularCarPawn::ApplyBodyVisual()
@@ -671,15 +783,16 @@ FVector AModularCarPawn::GetSymmetricPairWheelLocation(int32 PairIndex, bool bLe
 	const float HX = BodyExtent.X * 0.5f - 70.0f;
 	const float HY = BodyExtent.Y * 0.5f + 15.0f;
 	const float ZZ = -BodyExtent.Z * 0.5f - 10.0f;
+	const float AxleSpacing = 140.0f;
 
-	float X = HX;
-	if (PairIndex == 1)
+	// Alternate front / rear axles: pair 0 front, 1 rear, 2 front (+spacing), 3 rear (-spacing), ...
+	const bool bFrontAxle = (PairIndex % 2) == 0;
+	const int32 AxleGroup = PairIndex / 2;
+
+	float X = bFrontAxle ? HX : -HX;
+	if (AxleGroup > 0)
 	{
-		X = -HX;
-	}
-	else if (PairIndex > 1)
-	{
-		X = -HX - static_cast<float>(PairIndex - 1) * 140.0f;
+		X += (bFrontAxle ? 1.0f : -1.0f) * static_cast<float>(AxleGroup) * AxleSpacing;
 	}
 
 	const float Y = bLeftSide ? -HY : HY;
@@ -688,7 +801,7 @@ FVector AModularCarPawn::GetSymmetricPairWheelLocation(int32 PairIndex, bool bLe
 
 void AModularCarPawn::AppendSymmetricPairSpecs(int32 PairIndex)
 {
-	const bool bFrontAxle = (PairIndex == 0);
+	const bool bFrontAxle = (PairIndex % 2) == 0;
 	const float DefaultRadius = 35.0f;
 	const float DefaultWidth = 20.0f;
 
@@ -723,23 +836,32 @@ void AModularCarPawn::ApplyReplicatedWheelLayout()
 
 	for (FCarWheel& Wheel : Wheels)
 	{
-		if (Wheel.Mesh)
+		if (Wheel.Pivot)
+		{
+			Wheel.Pivot->DestroyComponent();
+		}
+		else if (Wheel.Mesh)
 		{
 			Wheel.Mesh->DestroyComponent();
 		}
 	}
 	Wheels.Reset();
 
-	for (const FModularCarWheelSpec& Spec : ReplicatedWheelSpecs)
+	for (int32 SpecIdx = 0; SpecIdx < ReplicatedWheelSpecs.Num(); ++SpecIdx)
 	{
+		const FModularCarWheelSpec& Spec = ReplicatedWheelSpecs[SpecIdx];
 		FCarWheel Wheel;
 		Wheel.RelativeLocation = Spec.RelativeLocation;
 		Wheel.bDriven = Spec.bDriven;
 		Wheel.bSteering = Spec.bSteering;
 		Wheel.Radius = Spec.Radius;
 		Wheel.Width = Spec.Width;
-		Wheel.Mesh = CreateWheelMesh(Spec.RelativeLocation, Spec.Radius, Spec.Width);
-		Wheels.Add(Wheel);
+		Wheel.SuspensionIndex = SpecIdx;
+		BuildWheelAssembly(Wheel);
+		if (Wheel.Mesh)
+		{
+			Wheels.Add(Wheel);
+		}
 	}
 
 	ScheduleRefreshPhysicsBindings();
@@ -931,67 +1053,56 @@ void AModularCarPawn::RebuildWheelSuspensions()
 		return;
 	}
 
-	struct FCornerSite
-	{
-		int32 PairIndex = 0;
-		bool bLeftSide = true;
-	};
-
-	static const FCornerSite CornerSites[] = {
-		{0, true}, {0, false}, {1, true}, {1, false}
-	};
-
 	const float DefaultRadius = 35.0f;
-	const float MatchThresholdSq = 100.0f * 100.0f;
-
 	CarAsync->WheelSuspensions.Reset();
-	CarAsync->WheelSuspensions.Reserve(UE_ARRAY_COUNT(CornerSites));
 
-	TArray<bool> WheelClaimed;
-	WheelClaimed.Init(false, Wheels.Num());
-
-	for (const FCornerSite& Corner : CornerSites)
+	if (Wheels.Num() > 0)
 	{
-		const FVector CornerLoc = GetSymmetricPairWheelLocation(Corner.PairIndex, Corner.bLeftSide);
-		FVector SiteLoc = CornerLoc;
-		float SiteRadius = DefaultRadius;
-
-		int32 BestWheelIdx = INDEX_NONE;
-		float BestDistSq = MatchThresholdSq;
+		CarAsync->WheelSuspensions.Reserve(Wheels.Num());
 		for (int32 WheelIdx = 0; WheelIdx < Wheels.Num(); ++WheelIdx)
 		{
-			if (WheelClaimed[WheelIdx])
-			{
-				continue;
-			}
-
-			const float DistSq = FVector::DistSquared(Wheels[WheelIdx].RelativeLocation, CornerLoc);
-			if (DistSq < BestDistSq)
-			{
-				BestDistSq = DistSq;
-				BestWheelIdx = WheelIdx;
-			}
+			const FCarWheel& Wheel = Wheels[WheelIdx];
+			ModularCarChaosSuspension::FWheelSuspensionRuntime& Entry = CarAsync->WheelSuspensions.AddDefaulted_GetRef();
+			Entry.LocalRestPosition = Wheel.RelativeLocation;
+			Entry.Radius = Wheel.Radius;
+			ModularCarChaosSuspension::FillSuspensionConfig(
+				Entry.Config,
+				SuspensionSpringRate,
+				SuspensionSpringPreload,
+				SuspensionMaxRaise,
+				SuspensionMaxDrop,
+				SuspensionDampingRatio,
+				SuspensionWheelLoadRatio,
+				SuspensionSmoothing);
+			Wheels[WheelIdx].SuspensionIndex = WheelIdx;
 		}
-
-		if (BestWheelIdx != INDEX_NONE)
+	}
+	else
+	{
+		struct FCornerSite
 		{
-			WheelClaimed[BestWheelIdx] = true;
-			SiteLoc = Wheels[BestWheelIdx].RelativeLocation;
-			SiteRadius = Wheels[BestWheelIdx].Radius;
+			int32 PairIndex = 0;
+			bool bLeftSide = true;
+		};
+		static const FCornerSite CornerSites[] = {
+			{0, true}, {0, false}, {1, true}, {1, false}
+		};
+		CarAsync->WheelSuspensions.Reserve(UE_ARRAY_COUNT(CornerSites));
+		for (const FCornerSite& Corner : CornerSites)
+		{
+			ModularCarChaosSuspension::FWheelSuspensionRuntime& Entry = CarAsync->WheelSuspensions.AddDefaulted_GetRef();
+			Entry.LocalRestPosition = GetSymmetricPairWheelLocation(Corner.PairIndex, Corner.bLeftSide);
+			Entry.Radius = DefaultRadius;
+			ModularCarChaosSuspension::FillSuspensionConfig(
+				Entry.Config,
+				SuspensionSpringRate,
+				SuspensionSpringPreload,
+				SuspensionMaxRaise,
+				SuspensionMaxDrop,
+				SuspensionDampingRatio,
+				SuspensionWheelLoadRatio,
+				SuspensionSmoothing);
 		}
-
-		ModularCarChaosSuspension::FWheelSuspensionRuntime& Entry = CarAsync->WheelSuspensions.AddDefaulted_GetRef();
-		Entry.LocalRestPosition = SiteLoc;
-		Entry.Radius = SiteRadius;
-		ModularCarChaosSuspension::FillSuspensionConfig(
-			Entry.Config,
-			SuspensionSpringRate,
-			SuspensionSpringPreload,
-			SuspensionMaxRaise,
-			SuspensionMaxDrop,
-			SuspensionDampingRatio,
-			SuspensionWheelLoadRatio,
-			SuspensionSmoothing);
 	}
 
 	const float GravityZ = GetWorld() ? GetWorld()->GetGravityZ() : -980.0f;
@@ -1014,6 +1125,9 @@ void AModularCarPawn::RefreshDriveTuningFromWheels()
 	if (CarAsync)
 	{
 		CarAsync->EngineForceTotal = EngineForcePerWheel * EffectiveWheels;
+		CarAsync->MaxYawRateRad = FMath::DegreesToRadians(MaxYawRate);
+		CarAsync->SteerRefSpeed = SteerRefSpeed;
+		CarAsync->MinSteerSpeedFraction = MinSteerSpeedFraction;
 	}
 
 	RebuildWheelSuspensions();
@@ -1101,6 +1215,7 @@ void AModularCarPawn::PostInitializeComponents()
 						CarAsync->MaxGripAccel = MaxGripAccel;
 						CarAsync->MaxYawRateRad = FMath::DegreesToRadians(MaxYawRate);
 						CarAsync->SteerRefSpeed = SteerRefSpeed;
+						CarAsync->MinSteerSpeedFraction = MinSteerSpeedFraction;
 						CarAsync->RestSpeedDeadzone = RestSpeedDeadzone;
 						CarAsync->bApplyDriveForces = ShouldApplyDriveForces();
 
@@ -1190,6 +1305,8 @@ void AModularCarPawn::Tick(float DeltaTime)
 			CarAsync->WheelSuspensions,
 			CarAsync->SuspensionHitCache);
 	}
+
+	UpdateWheelVisuals(DeltaTime);
 
 	PollKeyboard();
 	RunSelfTest(DeltaTime);

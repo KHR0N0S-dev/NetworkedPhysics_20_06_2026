@@ -120,6 +120,7 @@ public:
 	float MaxGripAccel = 1500.0f;  // cm/s^2 cap on grip force/mass (friction circle) so cars can be shoved
 	float MaxYawRateRad = 0.0f;    // rad/s target yaw rate at full steer & full speed
 	float SteerRefSpeed = 250.0f;
+	float MinSteerSpeedFraction = 0.4f;
 	float RestSpeedDeadzone = 3.0f;
 
 	// When false, skip drive/grip/steer (client sim-proxies: forces fight predicted-body contacts).
@@ -169,12 +170,22 @@ struct FCarWheel
 {
 	GENERATED_BODY()
 
+	// Steer + suspension pivot (attached to chassis).
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Wheel")
+	TObjectPtr<USceneComponent> Pivot = nullptr;
+
 	// Collision/support cylinder (hidden when cosmetic meshes are on).
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Wheel")
 	TObjectPtr<UStaticMeshComponent> Mesh = nullptr;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Wheel")
 	FVector RelativeLocation = FVector::ZeroVector;
+
+	/** Index into CarAsync suspension hit cache (matches Wheels order). */
+	int32 SuspensionIndex = INDEX_NONE;
+
+	/** Visual roll angle (rad) accumulated from forward speed. */
+	float VisualSpinAngle = 0.0f;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Wheel")
 	bool bDriven = true;
@@ -312,6 +323,14 @@ protected:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Modular Car|Drive")
 	float MaxYawRate = 80.0f;
 
+	/** Minimum steer strength at low speed (0-1 fraction of MaxYawRate). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Modular Car|Drive", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float MinSteerSpeedFraction = 0.4f;
+
+	/** Visual max steer angle (degrees) for steering wheels. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Modular Car|Visuals", meta = (ClampMin = "0.0", ClampMax = "60.0"))
+	float MaxVisualSteerAngle = 32.0f;
+
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Modular Car|Drive")
 	float SteerRefSpeed = 250.0f;
 
@@ -395,10 +414,15 @@ private:
 	void Input_Steer(const FInputActionValue& Value);
 	void Input_Handbrake(const FInputActionValue& Value);
 
-	/** Physics collision for chassis + wheels: block other bodies, ignore ground (suspension raycasts handle that). */
-	void ConfigureModularCarPartCollision(UStaticMeshComponent* Comp) const;
+	/** Cabin/body: blocks terrain and other bodies (fallback if a suspension ray misses). */
+	void ConfigureChassisCollision(UStaticMeshComponent* Comp) const;
 
-	UStaticMeshComponent* CreateWheelMesh(const FVector& RelLoc, float Radius, float Width);
+	/** Welded wheels: block other bodies, ignore ground (suspension raycasts only). */
+	void ConfigureWheelCollision(UStaticMeshComponent* Comp) const;
+
+	void BuildWheelAssembly(FCarWheel& Wheel);
+	void UpdateWheelVisuals(float DeltaTime);
+	int32 FindSuspensionIndexForWheelLocation(const FVector& LocalLocation) const;
 	void ApplyBodyVisual();
 	void RefreshDriveTuningFromWheels();
 	void RebuildWheelSuspensions();

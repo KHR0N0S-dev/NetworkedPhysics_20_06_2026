@@ -11,5 +11,8 @@ public class SandboxEditorTarget : TargetRules
 		IncludeOrderVersion = EngineIncludeOrderVersion.Latest;
 		DefaultBuildSettings = BuildSettingsVersion.Latest;
 		ExtraModuleNames.Add("Sandbox");
+
+		// ChaosVehicles + ChaosModularVehicleEngine collide in unity translation units.
+		DisableUnityBuildForModules = new string[] { "Sandbox" };
 	}
 }

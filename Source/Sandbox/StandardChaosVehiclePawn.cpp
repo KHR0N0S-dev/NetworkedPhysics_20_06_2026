@@ -1,4 +1,5 @@
 // Fill out your copyright notice in the Description page of Project Settings.
+// Compiled outside unity builds: ChaosVehicles + ChaosModularVehicle headers collide in merged TUs.
 
 #include "StandardChaosVehiclePawn.h"
 #include "Components/SkeletalMeshComponent.h"
