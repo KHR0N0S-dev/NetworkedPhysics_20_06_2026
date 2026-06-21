@@ -1,9 +1,16 @@
 // Fill out your copyright notice in the Description page of Project Settings.
 
 #include "ModularCarPawn.h"
+#include "ModularCarChaosSuspension.h"
+#include "ModularCarMapCollision.h"
+#include "ModularCarGameMode.h"
+#include "ModularCarMapBootstrap.h"
+
+#include "Components/WorldPartitionStreamingSourceComponent.h"
 
 #include "Components/StaticMeshComponent.h"
 #include "Components/SkeletalMeshComponent.h"
+#include "Components/SceneComponent.h"
 #include "Engine/SkeletalMesh.h"
 #include "Animation/AnimationAsset.h"
 #include "Components/InputComponent.h"
@@ -131,6 +138,7 @@ void FModularCarAsync::ProcessInputs_Internal(int32 PhysicsStep)
 	Throttle_Internal = AsyncInput->Throttle;
 	Steer_Internal = AsyncInput->Steer;
 	Handbrake_Internal = AsyncInput->Handbrake;
+
 }
 
 void FModularCarAsync::OnPreSimulate_Internal()
@@ -168,11 +176,30 @@ void FModularCarAsync::OnPreSimulate_Internal()
 		}
 	}
 
-	// Client sim-proxies must not apply grip/drive locally — the server's physics is authoritative and
-	// local grip forces fight predicted-body contacts (the multiplayer "sticking" bug).
+	// Client sim-proxies must not apply suspension/drive locally — server physics is authoritative.
 	if (!bApplyDriveForces)
 	{
 		return;
+	}
+
+	const float DeltaTime = GetDeltaTime_Internal();
+	const FVector VehicleLocation(ParticleHandle->GetX());
+	const FQuat VehicleRotation(ParticleHandle->GetR());
+	const FTransform VehicleWorldTM(VehicleRotation, VehicleLocation);
+	const FVector VehicleUpAxis = VehicleWorldTM.GetUnitAxis(EAxis::Z);
+
+	if (SimWorld.IsValid() && !WheelSuspensions.IsEmpty() && DeltaTime > SMALL_NUMBER)
+	{
+		ModularCarChaosSuspension::ApplySuspensionForces(
+			SimWorld.Get(),
+			SimOwner.Get(),
+			ParticleHandle,
+			VehicleWorldTM,
+			VehicleUpAxis,
+			DeltaTime,
+			WheelSuspensions,
+			SuspensionRollbarScaling,
+			&SuspensionHitCache);
 	}
 
 	const float Throttle = FMath::Clamp(Throttle_Internal, -1.0f, 1.0f);
@@ -224,19 +251,21 @@ void FModularCarAsync::OnPreSimulate_Internal()
 		ParticleHandle->AddForce(Force, true);
 	}
 
-	// Steering = command a target yaw rate directly (arcade model). Applying a torque through the
-	// welded body's (large, hard-to-estimate) moment of inertia barely turned the car; driving the
-	// yaw angular velocity toward a target gives a predictable, tunable "how sharp it turns" knob
-	// (MaxYawRate, deg/s) and stays deterministic for prediction/resimulation. Scaled by speed so
-	// the car only turns while rolling and reverses naturally in reverse.
+	// Steering using torque (preferred over direct SetW to avoid fighting solver/contacts/replication).
+	// This is the pattern used in Networked Physics tutorials and Chaos examples to reduce jitter.
+	// We approximate torque from desired yaw accel (error * gain). Gain tuned for responsiveness without oscillation.
 	if (FMath::Abs(Steer) > 0.01f && MaxYawRateRad > 0.0f)
 	{
 		const Chaos::FReal SpeedFrac = FMath::Clamp(FwdVel / FMath::Max((Chaos::FReal)SteerRefSpeed, (Chaos::FReal)1.0), (Chaos::FReal)-1.0, (Chaos::FReal)1.0);
 		const Chaos::FReal TargetYaw = Steer * SpeedFrac * MaxYawRateRad;
 		Chaos::FVec3 W = ParticleHandle->GetW();
-		// Converge quickly toward the target yaw rate; leave pitch/roll (tilt) to the solver.
-		W.Z = FMath::Lerp(W.Z, TargetYaw, (Chaos::FReal)0.5);
-		ParticleHandle->SetW(W);
+		const Chaos::FReal YawError = TargetYaw - W.Z;
+		// Simple proportional torque. Mass approx via 1 (torque units); scale to feel like previous yaw rate.
+		// Higher gain = snappier but can introduce jitter; lower = smoother.
+		const Chaos::FReal YawTorqueGain = 2000.0; // tuned value; adjust if needed
+		Chaos::FVec3 Torque(0.0);
+		Torque.Z = YawError * YawTorqueGain;
+		ParticleHandle->AddTorque(Torque, true /* bAllowSubstepping */);
 	}
 }
 
@@ -279,12 +308,20 @@ AModularCarPawn::AModularCarPawn()
 	Body->BodyInstance.bStartAwake = true;
 
 	SpringArm = CreateDefaultSubobject<USpringArmComponent>(TEXT("SpringArm"));
-	SpringArm->SetupAttachment(Body);
+
+	// Separate CameraTarget component for custom smoothing.
+	// SpringArm attaches to this instead of Body. We manually interpolate
+	// its transform every Tick for smooth camera follow without SpringArm's lag fighting physics/resim.
+	CameraTarget = CreateDefaultSubobject<USceneComponent>(TEXT("CameraTarget"));
+	CameraTarget->SetupAttachment(Body);
+
+	SpringArm->SetupAttachment(CameraTarget);
 	SpringArm->TargetArmLength = 2700.0f;
 	SpringArm->SocketOffset = FVector(0.0f, 0.0f, 750.0f);
 	SpringArm->bDoCollisionTest = false;
-	SpringArm->bEnableCameraLag = true;
-	SpringArm->CameraLagSpeed = 5.0f;
+	SpringArm->bEnableCameraLag = false;
+	SpringArm->CameraLagSpeed = 20.0f;
+
 	SpringArm->bInheritPitch = false;
 	SpringArm->bInheritRoll = false;
 	SpringArm->bInheritYaw = true;
@@ -292,6 +329,9 @@ AModularCarPawn::AModularCarPawn()
 
 	Camera = CreateDefaultSubobject<UCameraComponent>(TEXT("Camera"));
 	Camera->SetupAttachment(SpringArm, USpringArmComponent::SocketName);
+
+	WorldPartitionStreamingSource = CreateDefaultSubobject<UWorldPartitionStreamingSourceComponent>(TEXT("WorldPartitionStreamingSource"));
+	WorldPartitionStreamingSource->EnableStreamingSource();
 
 	// Cosmetic car (skeletal SKM_SportsCar - body + wheels in one mesh, rendered in ref pose),
 	// overlaid on the collision cube. Absolute scale so the chassis' non-uniform scale (sized from
@@ -352,6 +392,22 @@ void AModularCarPawn::InitializeChassisPhysics()
 		ChassisPhysMaterial->FrictionCombineMode = EFrictionCombineMode::Min;
 	}
 	Body->SetPhysMaterialOverride(ChassisPhysMaterial);
+	ConfigureModularCarPartCollision(Body);
+}
+
+void AModularCarPawn::ConfigureModularCarPartCollision(UStaticMeshComponent* Comp) const
+{
+	if (!Comp)
+	{
+		return;
+	}
+
+	Comp->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+	Comp->SetCollisionObjectType(ECC_PhysicsBody);
+	Comp->SetCollisionResponseToAllChannels(ECR_Block);
+	// Ground contact is raycast suspension only — wheels/chassis must not rest on or snag terrain.
+	Comp->SetCollisionResponseToChannel(ECC_WorldStatic, ECR_Ignore);
+	Comp->SetCollisionResponseToChannel(ECC_WorldDynamic, ECR_Ignore);
 }
 
 void AModularCarPawn::BeginPlay()
@@ -387,8 +443,26 @@ void AModularCarPawn::BeginPlay()
 	// Only the server may teleport/settle — clients (especially sim-proxies) must follow replication.
 	if (HasAuthority())
 	{
+		AModularCarMapBootstrap* Bootstrap = nullptr;
+		if (AModularCarGameMode* CarGameMode = GetWorld()->GetAuthGameMode<AModularCarGameMode>())
+		{
+			Bootstrap = CarGameMode->MapBootstrap;
+		}
+
+		// Map1 WP: stream landscape at the real spawn point (can differ from PlayerStart).
+		Bootstrap = ModularCarMapCollision::PrepareMapForVehicle(GetWorld(), GetActorLocation(), Bootstrap);
+		if (AModularCarGameMode* CarGameMode = GetWorld()->GetAuthGameMode<AModularCarGameMode>())
+		{
+			CarGameMode->MapBootstrap = Bootstrap;
+		}
+
+		RefreshDriveTuningFromWheels();
 		Body->WakeAllRigidBodies();
-		SettleOntoGround();
+		if (!SettleOntoGround())
+		{
+			bPendingGroundSettle = true;
+			GroundSettleElapsed = 0.0f;
+		}
 	}
 
 	// Hide the collision cube once the car body art is in place (collision/simulation unaffected).
@@ -402,6 +476,24 @@ void AModularCarPawn::BeginPlay()
 	ScheduleRefreshPhysicsBindings();
 
 	RefreshDriveTuningFromWheels();
+
+	if (CarAsync)
+	{
+		CarAsync->SimWorld = GetWorld();
+		CarAsync->SimOwner = this;
+	}
+
+	// Initialize CameraTarget to avoid first frame pop
+	if (CameraTarget && Body)
+	{
+		const FVector BodyLoc = Body->GetComponentLocation();
+		const FRotator BodyYawRot(0.0f, Body->GetComponentRotation().Yaw, 0.0f);
+		const FVector LocalOffset(-2700.0f, 0.0f, 750.0f);
+		CameraTarget->SetWorldLocation(BodyLoc + BodyYawRot.RotateVector(LocalOffset));
+		CameraTarget->SetWorldRotation(FRotator(-20.0f, BodyYawRot.Yaw, 0.0f));
+	}
+
+	UpdateCameraSmoothing(0.0f); // initial smooth
 
 	UE_LOG(LogTemp, Warning, TEXT("CARSETUP | Role=%d LC=%d RepMode=%d Sim=%d Grav=%d Mass=%.0f Wheels=%d Net=%d Hist=%d EngineForce=%.0f"),
 		(int32)GetLocalRole(), IsLocallyControlled() ? 1 : 0, (int32)GetPhysicsReplicationMode(),
@@ -424,19 +516,35 @@ void AModularCarPawn::BeginPlay()
 		CylVisible, Wheels.Num());
 }
 
-void AModularCarPawn::SettleOntoGround()
+bool AModularCarPawn::SettleOntoGround()
 {
 	UWorld* World = GetWorld();
 	if (!World)
 	{
-		return;
+		return false;
 	}
 
-	// Ride height = how far the lowest wheel reaches below the chassis centre.
+	// Ride height = lowest suspension site (always four corners; virtual when wheels removed).
+	const float DefaultRadius = 35.0f;
 	RestRideHeight = BodyExtent.Z * 0.5f;
+	for (int32 PairIdx = 0; PairIdx < 2; ++PairIdx)
+	{
+		for (const bool bLeftSide : {true, false})
+		{
+			const FVector Corner = GetSymmetricPairWheelLocation(PairIdx, bLeftSide);
+			RestRideHeight = FMath::Max(RestRideHeight, -(Corner.Z - DefaultRadius));
+		}
+	}
 	for (const FCarWheel& Wheel : Wheels)
 	{
 		RestRideHeight = FMath::Max(RestRideHeight, -(Wheel.RelativeLocation.Z - Wheel.Radius));
+	}
+	if (CarAsync)
+	{
+		for (const ModularCarChaosSuspension::FWheelSuspensionRuntime& Sus : CarAsync->WheelSuspensions)
+		{
+			RestRideHeight = FMath::Max(RestRideHeight, -(Sus.LocalRestPosition.Z - Sus.Radius));
+		}
 	}
 
 	Body->SetMassOverrideInKg(NAME_None, BodyMassKg, true);
@@ -446,17 +554,51 @@ void AModularCarPawn::SettleOntoGround()
 	FHitResult Hit;
 	const FVector Start = ActorLoc + FVector(0, 0, 2000.0f);
 	const FVector End = ActorLoc - FVector(0, 0, 5000.0f);
-	if (!World->LineTraceSingleByChannel(Hit, Start, End, ECC_WorldStatic, Params))
+	if (!ModularCarChaosSuspension::TraceGround(World, Start, End, this, Hit))
+	{
+		UE_LOG(LogTemp, Warning, TEXT("SettleOntoGround | No ground trace at %s"), *ActorLoc.ToString());
+		return false;
+	}
+
+	// Spawn slightly above rest height — must stay within suspension ray reach (MaxDrop + wheel radius).
+	float MaxWheelRadius = DefaultRadius;
+	for (const FCarWheel& Wheel : Wheels)
+	{
+		MaxWheelRadius = FMath::Max(MaxWheelRadius, Wheel.Radius);
+	}
+	const float MaxRayReachDown = SuspensionMaxDrop + MaxWheelRadius;
+	const float SpawnLift = FMath::Min(SuspensionMaxRaise + 5.0f, FMath::Max(5.0f, MaxRayReachDown * 0.5f));
+	FVector NewLoc = ActorLoc;
+	NewLoc.Z = Hit.ImpactPoint.Z + RestRideHeight + SpawnLift;
+	SetActorLocation(NewLoc, false, nullptr, ETeleportType::TeleportPhysics);
+	Body->SetPhysicsLinearVelocity(FVector::ZeroVector);
+	Body->SetPhysicsAngularVelocityInDegrees(FVector::ZeroVector);
+	return true;
+}
+
+void AModularCarPawn::UpdatePendingGroundSettle(float DeltaTime)
+{
+	if (!bPendingGroundSettle || !HasAuthority() || !Body)
 	{
 		return;
 	}
 
-	// Spawn slightly above the wheel rest height so the car gently settles onto its wheels.
-	FVector NewLoc = ActorLoc;
-	NewLoc.Z = Hit.ImpactPoint.Z + RestRideHeight + 45.0f;
-	SetActorLocation(NewLoc, false, nullptr, ETeleportType::TeleportPhysics);
-	Body->SetPhysicsLinearVelocity(FVector::ZeroVector);
-	Body->SetPhysicsAngularVelocityInDegrees(FVector::ZeroVector);
+	GroundSettleElapsed += DeltaTime;
+	ModularCarMapCollision::EnsureGroundReadyAtLocation(GetWorld(), GetActorLocation(), 0.25f);
+	ModularCarMapCollision::EnsureLevelGroundCollision(GetWorld());
+
+	if (SettleOntoGround())
+	{
+		bPendingGroundSettle = false;
+		return;
+	}
+
+	if (GroundSettleElapsed >= 8.0f)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("SettleOntoGround | Gave up after %.1fs at %s"),
+			GroundSettleElapsed, *GetActorLocation().ToString());
+		bPendingGroundSettle = false;
+	}
 }
 
 UStaticMeshComponent* AModularCarPawn::CreateWheelMesh(const FVector& RelLoc, float Radius, float Width)
@@ -470,8 +612,8 @@ UStaticMeshComponent* AModularCarPawn::CreateWheelMesh(const FVector& RelLoc, fl
 	Comp->SetMobility(EComponentMobility::Movable);
 	Comp->SetupAttachment(Body);
 	Comp->RegisterComponent();
-	// Weld into the chassis rigid body: the car rests on its four wheels (one body, four contact
-	// points) instead of on the cube's belly.
+	// Welded into the chassis compound: wheels collide with body, each other (same rigid body), and
+	// other vehicles — but never the ground (WorldStatic/WorldDynamic ignored on all car parts).
 	Comp->AttachToComponent(Body, FAttachmentTransformRules(EAttachmentRule::KeepRelative, true));
 
 	// Cylinder basic shape: radius ~50 in local XY, height 100 along local Z.
@@ -480,9 +622,7 @@ UStaticMeshComponent* AModularCarPawn::CreateWheelMesh(const FVector& RelLoc, fl
 	Comp->SetRelativeLocationAndRotation(RelLoc, FRotator(0.0f, 0.0f, 90.0f));
 	Comp->SetRelativeScale3D(Scale);
 
-	Comp->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
-	Comp->SetCollisionObjectType(ECC_PhysicsBody);
-	Comp->SetCollisionResponseToAllChannels(ECR_Block);
+	ConfigureModularCarPartCollision(Comp);
 	if (ChassisPhysMaterial)
 	{
 		Comp->SetPhysMaterialOverride(ChassisPhysMaterial);
@@ -784,6 +924,82 @@ void AModularCarPawn::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutL
 	DOREPLIFETIME(AModularCarPawn, ReplicatedWheelSpecs);
 }
 
+void AModularCarPawn::RebuildWheelSuspensions()
+{
+	if (!CarAsync)
+	{
+		return;
+	}
+
+	struct FCornerSite
+	{
+		int32 PairIndex = 0;
+		bool bLeftSide = true;
+	};
+
+	static const FCornerSite CornerSites[] = {
+		{0, true}, {0, false}, {1, true}, {1, false}
+	};
+
+	const float DefaultRadius = 35.0f;
+	const float MatchThresholdSq = 100.0f * 100.0f;
+
+	CarAsync->WheelSuspensions.Reset();
+	CarAsync->WheelSuspensions.Reserve(UE_ARRAY_COUNT(CornerSites));
+
+	TArray<bool> WheelClaimed;
+	WheelClaimed.Init(false, Wheels.Num());
+
+	for (const FCornerSite& Corner : CornerSites)
+	{
+		const FVector CornerLoc = GetSymmetricPairWheelLocation(Corner.PairIndex, Corner.bLeftSide);
+		FVector SiteLoc = CornerLoc;
+		float SiteRadius = DefaultRadius;
+
+		int32 BestWheelIdx = INDEX_NONE;
+		float BestDistSq = MatchThresholdSq;
+		for (int32 WheelIdx = 0; WheelIdx < Wheels.Num(); ++WheelIdx)
+		{
+			if (WheelClaimed[WheelIdx])
+			{
+				continue;
+			}
+
+			const float DistSq = FVector::DistSquared(Wheels[WheelIdx].RelativeLocation, CornerLoc);
+			if (DistSq < BestDistSq)
+			{
+				BestDistSq = DistSq;
+				BestWheelIdx = WheelIdx;
+			}
+		}
+
+		if (BestWheelIdx != INDEX_NONE)
+		{
+			WheelClaimed[BestWheelIdx] = true;
+			SiteLoc = Wheels[BestWheelIdx].RelativeLocation;
+			SiteRadius = Wheels[BestWheelIdx].Radius;
+		}
+
+		ModularCarChaosSuspension::FWheelSuspensionRuntime& Entry = CarAsync->WheelSuspensions.AddDefaulted_GetRef();
+		Entry.LocalRestPosition = SiteLoc;
+		Entry.Radius = SiteRadius;
+		ModularCarChaosSuspension::FillSuspensionConfig(
+			Entry.Config,
+			SuspensionSpringRate,
+			SuspensionSpringPreload,
+			SuspensionMaxRaise,
+			SuspensionMaxDrop,
+			SuspensionDampingRatio,
+			SuspensionWheelLoadRatio,
+			SuspensionSmoothing);
+	}
+
+	const float GravityZ = GetWorld() ? GetWorld()->GetGravityZ() : -980.0f;
+	ModularCarChaosSuspension::FinalizeSprungMassAndDamping(
+		CarAsync->WheelSuspensions, BodyMassKg, GravityZ);
+	CarAsync->SuspensionRollbarScaling = SuspensionRollbarScaling;
+}
+
 void AModularCarPawn::RefreshDriveTuningFromWheels()
 {
 	int32 DrivenCount = 0;
@@ -800,10 +1016,15 @@ void AModularCarPawn::RefreshDriveTuningFromWheels()
 		CarAsync->EngineForceTotal = EngineForcePerWheel * EffectiveWheels;
 	}
 
+	RebuildWheelSuspensions();
+
 	RestRideHeight = BodyExtent.Z * 0.5f;
-	for (const FCarWheel& W : Wheels)
+	if (CarAsync)
 	{
-		RestRideHeight = FMath::Max(RestRideHeight, -(W.RelativeLocation.Z - W.Radius));
+		for (const ModularCarChaosSuspension::FWheelSuspensionRuntime& Sus : CarAsync->WheelSuspensions)
+		{
+			RestRideHeight = FMath::Max(RestRideHeight, -(Sus.LocalRestPosition.Z - Sus.Radius));
+		}
 	}
 }
 
@@ -866,6 +1087,10 @@ void AModularCarPawn::PostInitializeComponents()
 			{
 				if (Chaos::FPhysicsSolver* Solver = PhysScene->GetSolver())
 				{
+					// Ensure determinism for resimulation/prediction to match exactly between server and clients.
+					// This is a key requirement mentioned in Chaos + NetworkPrediction discussions.
+					Solver->SetIsDeterministic(true);
+
 					CarAsync = Solver->CreateAndRegisterSimCallbackObject_External<FModularCarAsync>();
 					if (ensure(CarAsync))
 					{
@@ -950,20 +1175,39 @@ void AModularCarPawn::Tick(float DeltaTime)
 {
 	Super::Tick(DeltaTime);
 
+	UpdatePendingGroundSettle(DeltaTime);
 	UpdateAsyncDriveForcesFlag();
 	KeepDrivePhysicsAwake();
+
+	// Suspension raycasts must run on the game thread (landscape / WP heightfields are unreliable from the physics thread).
+	if (CarAsync && Body && Body->IsSimulatingPhysics() && ShouldApplyDriveForces()
+		&& !CarAsync->WheelSuspensions.IsEmpty())
+	{
+		ModularCarChaosSuspension::UpdateSuspensionHitCache(
+			GetWorld(),
+			this,
+			Body->GetComponentTransform(),
+			CarAsync->WheelSuspensions,
+			CarAsync->SuspensionHitCache);
+	}
 
 	PollKeyboard();
 	RunSelfTest(DeltaTime);
 
 	// Feed local input into the predicted physics sim.
-	if (CarAsync && IsLocallyControlled())
+	if (CarAsync)
 	{
-		if (FAsyncInputModularCar* AsyncInput = CarAsync->GetProducerInputData_External())
+		CarAsync->SimWorld = GetWorld();
+		CarAsync->SimOwner = this;
+
+		if (IsLocallyControlled())
 		{
-			AsyncInput->Throttle = ThrottleInput_External;
-			AsyncInput->Steer = SteerInput_External;
-			AsyncInput->Handbrake = HandbrakeInput_External;
+			if (FAsyncInputModularCar* AsyncInput = CarAsync->GetProducerInputData_External())
+			{
+				AsyncInput->Throttle = ThrottleInput_External;
+				AsyncInput->Steer = SteerInput_External;
+				AsyncInput->Handbrake = HandbrakeInput_External;
+			}
 		}
 	}
 
@@ -979,6 +1223,33 @@ void AModularCarPawn::Tick(float DeltaTime)
 		}
 		UE_LOG(LogTemp, Warning, TEXT("%s"), *Msg);
 	}
+
+	UpdateCameraSmoothing(DeltaTime);
+}
+
+void AModularCarPawn::UpdateCameraSmoothing(float DeltaTime)
+{
+	if (!CameraTarget || !Body) return;
+
+	// Compute desired chase position/rotation based on Body (yaw only for stable chase)
+	const FVector BodyLoc = Body->GetComponentLocation();
+	const FRotator BodyYawRot(0.0f, Body->GetComponentRotation().Yaw, 0.0f);
+
+	// Match previous SpringArm offsets: behind + up, with pitch
+	const FVector LocalOffset(-2700.0f, 0.0f, 750.0f);
+	const FVector DesiredLoc = BodyLoc + BodyYawRot.RotateVector(LocalOffset);
+
+	FRotator DesiredRot = BodyYawRot;
+	DesiredRot.Pitch = -20.0f;
+
+	// Independent smoothing (separate from any SpringArm lag)
+	const FVector CurLoc = CameraTarget->GetComponentLocation();
+	const FVector NewLoc = FMath::VInterpTo(CurLoc, DesiredLoc, DeltaTime, CameraLocationSmoothSpeed);
+	CameraTarget->SetWorldLocation(NewLoc);
+
+	const FRotator CurRot = CameraTarget->GetComponentRotation();
+	const FRotator NewRot = FMath::RInterpTo(CurRot, DesiredRot, DeltaTime, CameraRotationSmoothSpeed);
+	CameraTarget->SetWorldRotation(NewRot);
 }
 
 void AModularCarPawn::PollKeyboard()
@@ -1798,6 +2069,11 @@ void AModularCarPawn::RunSelfTest(float DeltaTime)
 		RestPeakAngSpeed = 0.0f;
 		RestMaxTilt = 0.0f;
 		SelfTestPeakYawRate = 0.0f;
+		DriveJitterMaxDeltaSpeed = 0.0f;
+		DriveJitterMaxDeltaAngSpeed = 0.0f;
+		DriveJitterPrevSpeed = 0.0f;
+		DriveJitterPrevAngSpeed = 0.0f;
+		bDriveJitterPrevSet = false;
 		UE_LOG(LogTemp, Warning, TEXT("SELFTEST START | Mode=%d (%s) StartPos=%s Wheels=%d"),
 			Mode, bRestTest ? TEXT("REST") : TEXT("DRIVE"), *SelfTestStartPos.ToString(), Wheels.Num());
 	}
@@ -1825,6 +2101,7 @@ void AModularCarPawn::RunSelfTest(float DeltaTime)
 	{
 		const float ZNow = Body->GetComponentLocation().Z;
 		const float SpeedNow = Body->GetComponentVelocity().Size();
+		const float AngSpeedNow = Body->GetPhysicsAngularVelocityInDegrees().Size();
 		SelfTestMinZ = FMath::Min(SelfTestMinZ, ZNow);
 		SelfTestMaxZ = FMath::Max(SelfTestMaxZ, ZNow);
 		if (bRestTest)
@@ -1834,7 +2111,7 @@ void AModularCarPawn::RunSelfTest(float DeltaTime)
 			RestMaxZ = FMath::Max(RestMaxZ, ZNow);
 			// Rotational jitter: angular speed and lean off vertical (cube/cylinders alone are dead
 			// stable, so any wobble here points at the cosmetic mesh's physics state interfering).
-			RestPeakAngSpeed = FMath::Max(RestPeakAngSpeed, (float)Body->GetPhysicsAngularVelocityInDegrees().Size());
+			RestPeakAngSpeed = FMath::Max(RestPeakAngSpeed, AngSpeedNow);
 			const float UpZ = FMath::Clamp((float)GetActorUpVector().Z, -1.0f, 1.0f);
 			RestMaxTilt = FMath::Max(RestMaxTilt, FMath::RadiansToDegrees(FMath::Acos(UpZ)));
 		}
@@ -1843,6 +2120,17 @@ void AModularCarPawn::RunSelfTest(float DeltaTime)
 			// How fast the car yaws under full steer = the felt "steering angle".
 			const float YawRate = FMath::Abs(Body->GetPhysicsAngularVelocityInDegrees().Z);
 			SelfTestPeakYawRate = FMath::Max(SelfTestPeakYawRate, YawRate);
+
+			// Drive-time jitter metric: max frame-to-frame change in speed and angular speed.
+			// This quantifies "дрожжание при движении" (client and server side) during sustained drive.
+			if (bDriveJitterPrevSet)
+			{
+				DriveJitterMaxDeltaSpeed = FMath::Max(DriveJitterMaxDeltaSpeed, FMath::Abs(SpeedNow - DriveJitterPrevSpeed));
+				DriveJitterMaxDeltaAngSpeed = FMath::Max(DriveJitterMaxDeltaAngSpeed, FMath::Abs(AngSpeedNow - DriveJitterPrevAngSpeed));
+			}
+			DriveJitterPrevSpeed = SpeedNow;
+			DriveJitterPrevAngSpeed = AngSpeedNow;
+			bDriveJitterPrevSet = true;
 		}
 	}
 
@@ -1879,6 +2167,8 @@ void AModularCarPawn::RunSelfTest(float DeltaTime)
 			const float RideBand = SelfTestMaxZ - SelfTestMinZ;
 			UE_LOG(LogTemp, Warning, TEXT("SELFTEST RIDE | MinZ=%.0f MaxZ=%.0f Band=%.0f PeakYawRate=%.1f deg/s (MaxYawRate=%.0f SteerRefSpeed=%.0f)"),
 				SelfTestMinZ, SelfTestMaxZ, RideBand, SelfTestPeakYawRate, MaxYawRate, SteerRefSpeed);
+			UE_LOG(LogTemp, Warning, TEXT("SELFTEST DRIVEJITTER | MaxDeltaSpeed=%.2f MaxDeltaAngSpeed=%.2f (lower is smoother; use with latency emulation)"),
+				DriveJitterMaxDeltaSpeed, DriveJitterMaxDeltaAngSpeed);
 		}
 
 		UE_LOG(LogTemp, Warning, TEXT("SELFTEST DONE"));

@@ -6,9 +6,12 @@
 #include "GameFramework/Pawn.h"
 #include "Physics/NetworkPhysicsComponent.h"
 #include "Physics/NetworkPhysicsSettingsComponent.h"
+#include "ModularCarChaosSuspension.h"
 #include "ModularCarPawn.generated.h"
 
 class UStaticMeshComponent;
+class UWorld;
+class AActor;
 class UStaticMesh;
 class USkeletalMeshComponent;
 class USkeletalMesh;
@@ -19,6 +22,8 @@ struct FInputActionValue;
 class USpringArmComponent;
 class UCameraComponent;
 class UPhysicalMaterial;
+class USceneComponent;
+class UWorldPartitionStreamingSourceComponent;
 class AModularCarPawn;
 
 //----------------------------------------------------
@@ -109,16 +114,23 @@ public:
 
 	// Tuning copied from the pawn before the sim starts (constant + identical on server/client, so
 	// prediction stays deterministic).
-	float EngineForceTotal = 1000000.0f;
-	float LateralGripRate = 12.0f;
+	float EngineForceTotal = 2500000.0f; // base, will be scaled by RefreshDriveTuningFromWheels * wheels
+	float LateralGripRate = 5.0f;
 	float LongitudinalGripRate = 4.0f;
 	float MaxGripAccel = 1500.0f;  // cm/s^2 cap on grip force/mass (friction circle) so cars can be shoved
 	float MaxYawRateRad = 0.0f;    // rad/s target yaw rate at full steer & full speed
-	float SteerRefSpeed = 350.0f;
+	float SteerRefSpeed = 250.0f;
 	float RestSpeedDeadzone = 3.0f;
 
 	// When false, skip drive/grip/steer (client sim-proxies: forces fight predicted-body contacts).
 	bool bApplyDriveForces = true;
+
+	// Chaos FSimpleSuspensionSim per wheel (raycast + spring/damper, same core as Chaos Vehicles).
+	TArray<ModularCarChaosSuspension::FWheelSuspensionRuntime> WheelSuspensions;
+	TArray<ModularCarChaosSuspension::FSuspensionHitCache> SuspensionHitCache;
+	TWeakObjectPtr<UWorld> SimWorld;
+	TWeakObjectPtr<AActor> SimOwner;
+	float SuspensionRollbarScaling = 0.15f;
 
 private:
 	float Throttle_Internal = 0.0f;
@@ -183,8 +195,9 @@ struct FCarWheel
 
 /**
  * A modular car built from primitives (cube chassis + cylinder wheels). The chassis is one rigid
- * body resting on its four (welded) wheels; drive / steering / grip forces are applied on the
- * physics thread with Chaos networked-physics prediction, so it is fully multiplayer.
+ * body held up by Chaos-style raycast suspension (FSimpleSuspensionSim). Wheels are welded collision
+ * shapes (contact with chassis / other cars, never ground). Drive forces run on the physics thread
+ * with Chaos networked-physics prediction.
  */
 UCLASS()
 class SANDBOX_API AModularCarPawn : public APawn
@@ -231,6 +244,8 @@ public:
 	void SetHandbrake(bool bEnabled) { HandbrakeInput_External = bEnabled ? 1.0f : 0.0f; }
 
 protected:
+	friend class FModularCarAsync;
+
 	virtual void BeginPlay() override;
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Modular Car")
@@ -246,6 +261,22 @@ protected:
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Modular Car")
 	TObjectPtr<UCameraComponent> Camera;
+
+	// Separate smoothed target for camera. SpringArm is attached to this instead of Body directly.
+	// This allows independent smoothing (lerp/interp) without using SpringArm's built-in lag,
+	// which was contributing to perceived jitter.
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Modular Car")
+	TObjectPtr<USceneComponent> CameraTarget;
+
+	/** Streams World Partition landscape cells under the car (required on Map1). */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Modular Car")
+	TObjectPtr<UWorldPartitionStreamingSourceComponent> WorldPartitionStreamingSource = nullptr;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Modular Car|Camera Smoothing")
+	float CameraLocationSmoothSpeed = 10.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Modular Car|Camera Smoothing")
+	float CameraRotationSmoothSpeed = 8.0f;
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Modular Car")
 	TArray<FCarWheel> Wheels;
@@ -273,7 +304,7 @@ protected:
 	float ChassisLinearDamping = 0.2f;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Modular Car|Drive")
-	float EngineForcePerWheel = 750000.0f;
+	float EngineForcePerWheel = 2500000.0f; // Increased for higher top speed and stronger acceleration
 
 	// Steering = target yaw rate (deg/s) at full steer, scaled by speed; the car only turns while
 	// rolling and reaches full turn rate at SteerRefSpeed (cm/s). This IS the "how sharp it turns"
@@ -285,8 +316,10 @@ protected:
 	float SteerRefSpeed = 250.0f;
 
 	// Grip = frame-rate-independent slip damping rate (1/s): force ~ -slipVel * mass * rate.
+	// Lowered significantly (torque steering + smoothing + decay should handle most). 
+	// Tune per feel; too high causes oscillation with contacts.
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Modular Car|Drive", meta = (ClampMin = "0.0"))
-	float LateralGripRate = 12.0f;
+	float LateralGripRate = 5.0f;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Modular Car|Drive", meta = (ClampMin = "0.0"))
 	float LongitudinalGripRate = 4.0f;
@@ -298,6 +331,31 @@ protected:
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Modular Car|Drive")
 	float RestSpeedDeadzone = 3.0f;
+
+	// Chaos Vehicles suspension (FSimpleSuspensionSim). SpringRate is N/m like UChaosVehicleWheel.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Modular Car|Suspension", meta = (ClampMin = "1.0"))
+	float SuspensionSpringRate = 250.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Modular Car|Suspension")
+	float SuspensionSpringPreload = 50.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Modular Car|Suspension", meta = (ClampMin = "0.0"))
+	float SuspensionMaxRaise = 30.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Modular Car|Suspension", meta = (ClampMin = "0.0"))
+	float SuspensionMaxDrop = 30.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Modular Car|Suspension", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float SuspensionDampingRatio = 0.5f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Modular Car|Suspension", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float SuspensionWheelLoadRatio = 0.5f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Modular Car|Suspension", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float SuspensionRollbarScaling = 0.15f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Modular Car|Suspension", meta = (ClampMin = "0", ClampMax = "10"))
+	int32 SuspensionSmoothing = 0;
 
 	UPROPERTY(EditAnywhere, Category = "Modular Car|Debug")
 	bool bDebugDrive = false;
@@ -322,21 +380,28 @@ protected:
 	FRotator BodyVisualRotation = FRotator(0.0f, 0.0f, 0.0f);
 
 private:
-	void SettleOntoGround();
+	bool SettleOntoGround();
+	void UpdatePendingGroundSettle(float DeltaTime);
 	void PollKeyboard();
 	void RunSelfTest(float DeltaTime);
 	bool ShouldApplyDriveForces() const;
 	void UpdateAsyncDriveForcesFlag();
 	void KeepDrivePhysicsAwake();
 
+	void UpdateCameraSmoothing(float DeltaTime);
+
 	void EnsureInputAssets();
 	void Input_Throttle(const FInputActionValue& Value);
 	void Input_Steer(const FInputActionValue& Value);
 	void Input_Handbrake(const FInputActionValue& Value);
 
+	/** Physics collision for chassis + wheels: block other bodies, ignore ground (suspension raycasts handle that). */
+	void ConfigureModularCarPartCollision(UStaticMeshComponent* Comp) const;
+
 	UStaticMeshComponent* CreateWheelMesh(const FVector& RelLoc, float Radius, float Width);
 	void ApplyBodyVisual();
 	void RefreshDriveTuningFromWheels();
+	void RebuildWheelSuspensions();
 	void InitializeChassisPhysics();
 	void ApplyReplicatedWheelLayout();
 	void RefreshPhysicsBindings();
@@ -400,6 +465,9 @@ private:
 	float RestRideHeight = 35.0f;
 
 	// Self-test (headless), driven by the "car.SelfTest" CVar.
+	bool bPendingGroundSettle = false;
+	float GroundSettleElapsed = 0.0f;
+
 	bool bSelfTestStarted = false;
 	float SelfTestTime = 0.0f;
 	float SelfTestLogAccum = 0.0f;
@@ -418,6 +486,13 @@ private:
 	FVector SelfTestResumeDriveStartPos = FVector::ZeroVector;
 	float SelfTestResumePeakSpeed = 0.0f;
 	bool bSelfTestResumeDrivePhase = false;
+
+	// Drive jitter measurement (for sustained movement stability test).
+	float DriveJitterMaxDeltaSpeed = 0.0f;
+	float DriveJitterMaxDeltaAngSpeed = 0.0f;
+	float DriveJitterPrevSpeed = 0.0f;
+	float DriveJitterPrevAngSpeed = 0.0f;
+	bool bDriveJitterPrevSet = false;
 
 	// Collision self-test (mode 4): ram a second spawned car and check the physics stays sane.
 	UPROPERTY()

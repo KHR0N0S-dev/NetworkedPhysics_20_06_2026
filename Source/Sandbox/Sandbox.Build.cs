@@ -25,7 +25,8 @@ public class Sandbox : ModuleRules
 			"ChaosVehiclesCore",
 			"ChaosVehiclesEngine",
 			"GeometryCollectionEngine",
-			"ChaosModularVehicleEngine"
+			"ChaosModularVehicleEngine",
+			"Landscape"
 		});
 		
 		PublicIncludePaths.AddRange(new string[] {
