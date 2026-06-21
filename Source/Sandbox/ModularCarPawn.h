@@ -398,6 +398,14 @@ protected:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Modular Car|Visuals")
 	FRotator BodyVisualRotation = FRotator(0.0f, 0.0f, 0.0f);
 
+	/** Network relevancy radius (cm). Default engine pawn is 15000 (~150 m); raised for large maps. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Modular Car|Network", meta = (ClampMin = "10000.0"))
+	float VehicleNetCullDistanceCm = 200000.0f;
+
+	/** World Partition loading-range multiplier for this car's streaming source. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Modular Car|Streaming", meta = (ClampMin = "1.0", ClampMax = "16.0"))
+	float StreamingLoadingRangeScale = 4.0f;
+
 private:
 	bool SettleOntoGround();
 	void UpdatePendingGroundSettle(float DeltaTime);
@@ -424,6 +432,7 @@ private:
 	void UpdateWheelVisuals(float DeltaTime);
 	int32 FindSuspensionIndexForWheelLocation(const FVector& LocalLocation) const;
 	void ApplyBodyVisual();
+	void ApplyVehicleVisibilitySettings();
 	void RefreshDriveTuningFromWheels();
 	void RebuildWheelSuspensions();
 	void InitializeChassisPhysics();

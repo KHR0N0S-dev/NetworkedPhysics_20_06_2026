@@ -2,6 +2,7 @@
 
 #include "Components/SceneComponent.h"
 #include "Components/WorldPartitionStreamingSourceComponent.h"
+#include "WorldPartition/WorldPartitionStreamingSource.h"
 
 AModularCarMapBootstrap::AModularCarMapBootstrap()
 {
@@ -13,4 +14,8 @@ AModularCarMapBootstrap::AModularCarMapBootstrap()
 
 	StreamingSource = CreateDefaultSubobject<UWorldPartitionStreamingSourceComponent>(TEXT("StreamingSource"));
 	StreamingSource->EnableStreamingSource();
+	StreamingSource->Priority = EStreamingSourcePriority::Highest;
+	FStreamingSourceShape& Shape = StreamingSource->Shapes.AddDefaulted_GetRef();
+	Shape.bUseGridLoadingRange = true;
+	Shape.LoadingRangeScale = 4.0f;
 }

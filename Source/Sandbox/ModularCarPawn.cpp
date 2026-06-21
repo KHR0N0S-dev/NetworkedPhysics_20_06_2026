@@ -7,6 +7,7 @@
 #include "ModularCarMapBootstrap.h"
 
 #include "Components/WorldPartitionStreamingSourceComponent.h"
+#include "WorldPartition/WorldPartitionStreamingSource.h"
 
 #include "Components/StaticMeshComponent.h"
 #include "Components/SkeletalMeshComponent.h"
@@ -289,6 +290,7 @@ AModularCarPawn::AModularCarPawn()
 	// and resimulation remain on UNetworkPhysicsComponent. Disabling movement replication freezes
 	// remote cars on clients because they never receive SetRigidBodyReplicatedTarget updates.
 	SpawnCollisionHandlingMethod = ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButAlwaysSpawn;
+	SetNetCullDistanceSquared(FMath::Square(200000.0f));
 
 	static ConstructorHelpers::FObjectFinder<UStaticMesh> CubeFinder(TEXT("/Engine/BasicShapes/Cube.Cube"));
 	static ConstructorHelpers::FObjectFinder<UStaticMesh> CylinderFinder(TEXT("/Engine/BasicShapes/Cylinder.Cylinder"));
@@ -343,6 +345,7 @@ AModularCarPawn::AModularCarPawn()
 
 	WorldPartitionStreamingSource = CreateDefaultSubobject<UWorldPartitionStreamingSourceComponent>(TEXT("WorldPartitionStreamingSource"));
 	WorldPartitionStreamingSource->EnableStreamingSource();
+	WorldPartitionStreamingSource->Priority = EStreamingSourcePriority::Highest;
 
 	// Cosmetic car (skeletal SKM_SportsCar - body + wheels in one mesh, rendered in ref pose),
 	// overlaid on the collision cube. Absolute scale so the chassis' non-uniform scale (sized from
@@ -493,6 +496,7 @@ void AModularCarPawn::BeginPlay()
 		Body->SetVisibility(false);
 	}
 	ApplyBodyVisual();
+	ApplyVehicleVisibilitySettings();
 	ApplyNetworkPhysicsReplicationMode();
 	EnsureNetworkPhysicsHistory();
 	ScheduleRefreshPhysicsBindings();
@@ -660,6 +664,7 @@ void AModularCarPawn::BuildWheelAssembly(FCarWheel& Wheel)
 	Comp->SetRelativeScale3D(Scale);
 
 	ConfigureWheelCollision(Comp);
+	Comp->bNeverDistanceCull = true;
 	if (ChassisPhysMaterial)
 	{
 		Comp->SetPhysMaterialOverride(ChassisPhysMaterial);
@@ -749,6 +754,36 @@ void AModularCarPawn::UpdateWheelVisuals(float DeltaTime)
 			const float SpinDeg = FMath::RadiansToDegrees(Wheel.VisualSpinAngle);
 			Wheel.Mesh->SetRelativeRotation(FRotator(SpinDeg, 0.0f, 90.0f));
 		}
+	}
+}
+
+void AModularCarPawn::ApplyVehicleVisibilitySettings()
+{
+	const float CullCm = FMath::Max(10000.0f, VehicleNetCullDistanceCm);
+	SetNetCullDistanceSquared(FMath::Square(CullCm));
+
+	auto NeverCull = [](UPrimitiveComponent* Comp)
+	{
+		if (Comp)
+		{
+			Comp->bNeverDistanceCull = true;
+		}
+	};
+
+	NeverCull(Body);
+	NeverCull(BodyVisual);
+	for (FCarWheel& Wheel : Wheels)
+	{
+		NeverCull(Wheel.Mesh);
+	}
+
+	if (WorldPartitionStreamingSource)
+	{
+		WorldPartitionStreamingSource->Priority = EStreamingSourcePriority::Highest;
+		WorldPartitionStreamingSource->Shapes.Reset();
+		FStreamingSourceShape& Shape = WorldPartitionStreamingSource->Shapes.AddDefaulted_GetRef();
+		Shape.bUseGridLoadingRange = true;
+		Shape.LoadingRangeScale = FMath::Clamp(StreamingLoadingRangeScale, 1.0f, 16.0f);
 	}
 }
 
@@ -869,6 +904,7 @@ void AModularCarPawn::ApplyReplicatedWheelLayout()
 		}
 	}
 
+	ApplyVehicleVisibilitySettings();
 	ScheduleRefreshPhysicsBindings();
 	RefreshDriveTuningFromWheels();
 }

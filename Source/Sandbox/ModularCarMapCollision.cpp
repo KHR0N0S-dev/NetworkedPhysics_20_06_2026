@@ -74,7 +74,8 @@ namespace ModularCarMapCollision
 		UWorldPartitionSubsystem* WorldPartition = World->GetSubsystem<UWorldPartitionSubsystem>();
 		TArray<FWorldPartitionStreamingQuerySource> QuerySources;
 		FWorldPartitionStreamingQuerySource& Query = QuerySources.Add_GetRef(FWorldPartitionStreamingQuerySource(Location));
-		Query.bUseGridLoadingRange = true;
+		Query.bUseGridLoadingRange = false;
+		Query.Radius = 200000.0f;
 
 		const double Deadline = FPlatformTime::Seconds() + static_cast<double>(MaxWaitSeconds);
 		while (FPlatformTime::Seconds() < Deadline)
